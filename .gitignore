@@ -19,6 +19,19 @@ target/
 .env
 .env.*
 !.env.example
+.envrc
+.npmrc
+.netrc
+.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
 
 # Test coverage
 coverage/

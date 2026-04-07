@@ -2,6 +2,16 @@
 
 This project adds better Linux support for the Zenbook Duo by running a small background service that reacts to the keyboard being attached/detached (USB or Bluetooth) and keeps the dual-screen experience usable.
 
+## Project Status
+
+- Source code base: https://github.com/Fmstrat/zenbook-duo-linux
+- Current status: actively being updated and tested
+- Implemented so far:
+  - Bottom screen on/off switching
+  - Airplane mode state correction
+  - Keyboard detection and connection handling
+- Some features still have minor bugs and are currently being fixed.
+
 ## Quick Start (Non-technical)
 
 ### What you need
