@@ -1,0 +1,1545 @@
+use std::fs;
+use std::io;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::Arc;
+
+use chrono::{Duration as ChronoDuration, Utc};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{timeout, Duration};
+
+use crate::ipc::protocol::{
+    DaemonRequest, DaemonResponse, Envelope, LifecyclePhase, SessionCommand, SessionResponse,
+    PROTOCOL_VERSION,
+};
+use crate::runtime::{logger, paths, state::RuntimeState};
+use crate::{
+    commands, hardware,
+    models::{DisplayLayout, EventCategory, HardwareEvent, Orientation},
+};
+
+const SESSION_COMMAND_TIMEOUT_DEFAULT: Duration = Duration::from_secs(3);
+const SESSION_COMMAND_TIMEOUT_DOCK_MODE: Duration = Duration::from_secs(12);
+const SESSION_COMMAND_TIMEOUT_PROBE: Duration = Duration::from_millis(1200);
+const SESSION_TIMEOUT_DISCONNECT_THRESHOLD: usize = 3;
+const DOCK_REPLAY_MAX_ATTEMPTS: usize = 3;
+const DOCK_REPLAY_RETRY_DELAY: Duration = Duration::from_millis(800);
+
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static DOCK_TARGET_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SESSION_TIMEOUT_STREAK: AtomicUsize = AtomicUsize::new(0);
+static DOCK_REPLAY_TARGET: OnceLock<Mutex<Option<DockReplayTarget>>> = OnceLock::new();
+static DOCK_REPLAY_EXECUTOR: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct DockReplayTarget {
+    attached: bool,
+    scale: f64,
+    generation: u64,
+}
+
+pub async fn run() -> Result<(), String> {
+    crate::runtime::runtime_dir::ensure_target_user_runtime_dir()?;
+    ensure_parent(paths::daemon_socket_path().as_path())
+        .map_err(|e| format!("Failed to prepare daemon runtime dir: {e}"))?;
+    remove_stale_socket(paths::daemon_socket_path().as_path());
+
+    let listener = UnixListener::bind(paths::daemon_socket_path())
+        .map_err(|e| format!("Failed to bind daemon socket: {e}"))?;
+    configure_daemon_socket(paths::daemon_socket_path().as_path())
+        .map_err(|e| format!("Failed to configure daemon socket: {e}"))?;
+    let state = Arc::new(RwLock::new(initialize_state()));
+    crate::runtime::monitor::start(state.clone());
+    crate::runtime::logind::start(state.clone());
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("Failed to accept daemon client: {e}"))?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_client(stream, state).await {
+                log::warn!("daemon client error: {err}");
+            }
+        });
+    }
+}
+
+fn configure_daemon_socket(path: &Path) -> Result<(), String> {
+    let uid = std::env::var("ZENBOOK_DUO_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let gid = std::env::var("ZENBOOK_DUO_GID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+
+    if let (Some(uid), Some(gid)) = (uid, gid) {
+        let path_cstr = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| format!("Socket path contains interior NUL: {}", path.display()))?;
+        let result = unsafe { libc::chown(path_cstr.as_ptr(), uid, gid) };
+        if result != 0 {
+            return Err(format!(
+                "chown({}, {}, {}) failed: {}",
+                path.display(),
+                uid,
+                gid,
+                io::Error::last_os_error()
+            ));
+        }
+    }
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o660))
+        .map_err(|e| format!("chmod {} failed: {e}", path.display()))?;
+
+    Ok(())
+}
+
+fn initialize_state() -> RuntimeState {
+    let mut state = RuntimeState::load();
+    state.status = crate::runtime::probe::current_status();
+    state.status.service_active = false;
+    state.settings = commands::settings::load_settings_local();
+    state.session_agent = Default::default();
+    state.touch();
+    persist_state(&state);
+    let _ = logger::append_line("rust-daemon: initialized runtime state");
+    state
+}
+
+fn dock_replay_target_cell() -> &'static Mutex<Option<DockReplayTarget>> {
+    DOCK_REPLAY_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+fn dock_replay_executor_lock() -> &'static Mutex<()> {
+    DOCK_REPLAY_EXECUTOR.get_or_init(|| Mutex::new(()))
+}
+
+async fn set_dock_replay_target(attached: bool, scale: f64) -> DockReplayTarget {
+    let generation = DOCK_TARGET_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let target = DockReplayTarget {
+        attached,
+        scale,
+        generation,
+    };
+    let mut guard = dock_replay_target_cell().lock().await;
+    *guard = Some(target);
+    target
+}
+
+async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> Result<(), String> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("Failed to read daemon request: {e}"))?
+    {
+        let envelope: Envelope<DaemonRequest> =
+            serde_json::from_str(&line).map_err(|e| format!("Invalid daemon request JSON: {e}"))?;
+
+        if envelope.protocol_version != PROTOCOL_VERSION {
+            write_response(
+                &mut writer,
+                DaemonResponse::Error {
+                    message: format!(
+                        "Protocol mismatch: expected {}, got {}",
+                        PROTOCOL_VERSION, envelope.protocol_version
+                    ),
+                },
+            )
+            .await?;
+            continue;
+        }
+
+        let response = match envelope.payload {
+            DaemonRequest::Ping => DaemonResponse::Pong,
+            DaemonRequest::HandleLifecycle { phase } => match handle_lifecycle(&state, phase).await
+            {
+                Ok(()) => DaemonResponse::Ack,
+                Err(message) => DaemonResponse::Error { message },
+            },
+            DaemonRequest::GetStatus => {
+                let guard = state.read().await;
+                let mut status = guard.status.clone();
+                status.service_active = guard.session_agent.connected;
+                DaemonResponse::Status { status }
+            }
+            DaemonRequest::GetDisplayLayout => {
+                match request_session(state.clone(), SessionCommand::GetDisplayLayout, true).await {
+                    Ok(SessionResponse::DisplayLayout { layout }) => {
+                        DaemonResponse::DisplayLayout { layout }
+                    }
+                    Ok(SessionResponse::Error { message }) => DaemonResponse::Error { message },
+                    Ok(_) => DaemonResponse::Error {
+                        message: "Unexpected session-agent response while reading display layout"
+                            .into(),
+                    },
+                    Err(_) => match hardware::display_config::get_display_layout() {
+                        Ok(layout) => DaemonResponse::DisplayLayout { layout },
+                        Err(message) => DaemonResponse::Error { message },
+                    },
+                }
+            }
+            DaemonRequest::GetSettings => {
+                let guard = state.read().await;
+                DaemonResponse::Settings {
+                    settings: guard.settings.clone(),
+                }
+            }
+            DaemonRequest::UsbMediaRemapStatus => DaemonResponse::UsbMediaRemapStatus {
+                status: commands::usb_media_remap::get_status(),
+            },
+            DaemonRequest::SaveSettings { settings } => {
+                let mut guard = state.write().await;
+                guard.settings = settings;
+                guard.touch();
+                persist_state(&guard);
+                DaemonResponse::Ack
+            }
+            DaemonRequest::SetBacklight { level } => match hardware::hid::set_backlight(level) {
+                Ok(()) => {
+                    let mut guard = state.write().await;
+                    guard.status.backlight_level = level;
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: set backlight request -> {level}"
+                    ));
+                    guard.recent_events.push(HardwareEvent::info(
+                        EventCategory::Keyboard,
+                        format!("Backlight set to {level}"),
+                        "rust-daemon",
+                    ));
+                    guard.touch();
+                    persist_state(&guard);
+                    DaemonResponse::Ack
+                }
+                Err(message) => DaemonResponse::Error { message },
+            },
+            DaemonRequest::SetOrientation { orientation } => {
+                apply_orientation(&state, orientation).await
+            }
+            DaemonRequest::ApplyDisplayLayout { layout } => {
+                apply_display_layout_request(&state, layout).await
+            }
+            DaemonRequest::UsbMediaRemapStart => {
+                let _ = logger::append_line("rust-daemon: start usb media remap request");
+                match commands::usb_media_remap::start_remap() {
+                    Ok(()) => DaemonResponse::Ack,
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::UsbMediaRemapStop => {
+                let _ = logger::append_line("rust-daemon: stop usb media remap request");
+                match commands::usb_media_remap::stop_remap() {
+                    Ok(()) => DaemonResponse::Ack,
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::UsbMediaRemapTogglePause => {
+                let _ = logger::append_line("rust-daemon: toggle usb media remap pause request");
+                match commands::usb_media_remap::toggle_pause() {
+                    Ok(()) => DaemonResponse::Ack,
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::RestartService => DaemonResponse::Error {
+                message: "Service restart not yet owned by rust-daemon".into(),
+            },
+            DaemonRequest::RegisterSessionAgent {
+                session_id,
+                backend,
+                socket_path,
+            } => {
+                match handle_session_registration(&state, session_id, backend, socket_path).await {
+                    Ok(()) => DaemonResponse::Ack,
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::TailLogs { lines } => DaemonResponse::Logs {
+                lines: hardware::sysfs::read_log_lines(lines),
+            },
+            DaemonRequest::ClearLogs => match logger::clear() {
+                Ok(()) => DaemonResponse::Ack,
+                Err(message) => DaemonResponse::Error { message },
+            },
+            DaemonRequest::GetRecentEvents { limit } => {
+                let guard = state.read().await;
+                let events = guard
+                    .recent_events
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                DaemonResponse::Events { events }
+            }
+            DaemonRequest::ListTouchscreens => {
+                let devices = hardware::touchscreen::list_touchscreens();
+                DaemonResponse::Touchscreens { devices }
+            }
+            DaemonRequest::SetTouchscreenEnabled { connector, enabled } => {
+                let devices = hardware::touchscreen::list_touchscreens();
+                match devices.iter().find(|d| d.connector == connector) {
+                    Some(dev) => {
+                        match hardware::touchscreen::set_touchscreen_enabled(&dev.i2c_id, enabled) {
+                            Ok(()) => DaemonResponse::Ack,
+                            Err(message) => DaemonResponse::Error { message },
+                        }
+                    }
+                    None => DaemonResponse::Error {
+                        message: format!("No touchscreen found for connector {}", connector),
+                    },
+                }
+            }
+        };
+
+        write_response(&mut writer, response).await?;
+    }
+
+    Ok(())
+}
+
+async fn write_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    response: DaemonResponse,
+) -> Result<(), String> {
+    let line = serde_json::to_string(&Envelope::new(response))
+        .map_err(|e| format!("Failed to encode daemon response: {e}"))?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write daemon response: {e}"))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|e| format!("Failed to terminate daemon response: {e}"))
+}
+
+fn ensure_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn remove_stale_socket(path: &Path) {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_socket() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn persist_state(state: &RuntimeState) {
+    if let Err(err) = state.save() {
+        log::warn!("failed to persist runtime state: {err}");
+        let _ = logger::append_line(format!("rust-daemon: failed to persist state: {err}"));
+    }
+}
+
+async fn handle_lifecycle(
+    state: &Arc<RwLock<RuntimeState>>,
+    phase: LifecyclePhase,
+) -> Result<(), String> {
+    match phase {
+        LifecyclePhase::Pre | LifecyclePhase::Hibernate | LifecyclePhase::Shutdown => {
+            logger::append_line(format!("rust-daemon: lifecycle -> {:?}", phase)).ok();
+            hardware::hid::set_backlight(0)?;
+
+            let mut guard = state.write().await;
+            guard.recent_events.push(HardwareEvent::info(
+                EventCategory::Service,
+                format!("Lifecycle event: {:?}", phase),
+                "rust-daemon",
+            ));
+            guard.touch();
+            persist_state(&guard);
+            Ok(())
+        }
+        LifecyclePhase::Post | LifecyclePhase::Thaw | LifecyclePhase::Boot => {
+            logger::append_line(format!("rust-daemon: lifecycle -> {:?}", phase)).ok();
+
+            let (restore_level, scale) = {
+                let guard = state.read().await;
+                (guard.status.backlight_level, guard.settings.default_scale)
+            };
+            hardware::hid::set_backlight(restore_level)?;
+
+            let refreshed = crate::runtime::probe::current_status();
+            let attached = refreshed.keyboard_attached;
+
+            {
+                let mut guard = state.write().await;
+                let previous_level = guard.status.backlight_level;
+                guard.status = refreshed;
+                guard.status.backlight_level = previous_level;
+                guard.status.service_active = guard.session_agent.connected;
+                guard.recent_events.push(HardwareEvent::info(
+                    EventCategory::Service,
+                    format!("Lifecycle event: {:?}", phase),
+                    "rust-daemon",
+                ));
+                guard.touch();
+                persist_state(&guard);
+            }
+
+            // Restore touchscreen disabled state
+            {
+                let guard = state.read().await;
+                let disabled = guard.settings.touchscreen_disabled.clone();
+                drop(guard);
+                for connector in &disabled {
+                    let devices = hardware::touchscreen::list_touchscreens();
+                    if let Some(dev) = devices.iter().find(|d| &d.connector == connector) {
+                        if let Err(e) =
+                            hardware::touchscreen::set_touchscreen_enabled(&dev.i2c_id, false)
+                        {
+                            eprintln!(
+                                "rust-daemon: failed to restore touchscreen disabled for {}: {}",
+                                connector, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            match replay_current_dock_mode(state, attached, scale).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    notify_runtime_error(
+                        state,
+                        "Zenbook Duo Runtime Error",
+                        &format!("Lifecycle dock refresh skipped: {err}"),
+                    )
+                    .await;
+                    logger::append_line(format!(
+                        "rust-daemon: lifecycle dock refresh skipped: {}",
+                        err
+                    ))
+                    .ok();
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+async fn handle_session_registration(
+    state: &Arc<RwLock<RuntimeState>>,
+    session_id: String,
+    backend: crate::ipc::protocol::SessionBackend,
+    socket_path: String,
+) -> Result<(), String> {
+    let session_generation = SESSION_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+
+    let (attached, scale) = {
+        let mut guard = state.write().await;
+        guard.session_agent.connected = true;
+        guard.session_agent.session_id = Some(session_id);
+        guard.session_agent.backend = Some(backend);
+        guard.session_agent.socket_path = Some(socket_path);
+        guard.status.service_active = true;
+        let _ = logger::append_line(format!(
+            "rust-daemon: session agent registered ({:?}) session_generation={}",
+            guard.session_agent.backend, session_generation
+        ));
+        guard.touch();
+        persist_state(&guard);
+        (guard.status.keyboard_attached, guard.settings.default_scale)
+    };
+
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        if let Err(err) = replay_current_dock_mode(&state, attached, scale).await {
+            log::warn!("session registration dock replay failed: {err}");
+            notify_runtime_error(
+                &state,
+                "Zenbook Duo Runtime Error",
+                &format!("Session registration dock replay skipped: {err}"),
+            )
+            .await;
+            let _ = logger::append_line(format!(
+                "rust-daemon: session registration dock replay skipped: {}",
+                err
+            ));
+        }
+    });
+
+    Ok(())
+}
+
+async fn replay_current_dock_mode(
+    state: &Arc<RwLock<RuntimeState>>,
+    attached: bool,
+    scale: f64,
+) -> Result<(), String> {
+    let requested = set_dock_replay_target(attached, scale).await;
+    let session_generation = SESSION_GENERATION.load(Ordering::Relaxed);
+    let _ = logger::append_line(format!(
+        "rust-daemon: queued dock replay target session_generation={} dock_target_generation={} attached={} scale={}",
+        session_generation, requested.generation, requested.attached, requested.scale
+    ));
+
+    let _executor_guard = dock_replay_executor_lock().lock().await;
+    loop {
+        let current_target = {
+            let guard = dock_replay_target_cell().lock().await;
+            *guard
+        };
+        let Some(current_target) = current_target else {
+            return Ok(());
+        };
+
+        let mut last_error: Option<String> = None;
+        let mut succeeded = false;
+        for attempt in 1..=DOCK_REPLAY_MAX_ATTEMPTS {
+            let _ = logger::append_line(format!(
+                "rust-daemon: dock replay attempt {}/{} session_generation={} dock_target_generation={} attached={} scale={} replay_attempt={}",
+                attempt,
+                DOCK_REPLAY_MAX_ATTEMPTS,
+                session_generation,
+                current_target.generation,
+                current_target.attached,
+                current_target.scale,
+                attempt
+            ));
+
+            let command = SessionCommand::SetDockMode {
+                attached: current_target.attached,
+                scale: current_target.scale,
+            };
+            match forward_session_command(state, command).await {
+                Ok(()) => {
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: dock replay succeeded session_generation={} dock_target_generation={} replay_attempt={}",
+                        session_generation, current_target.generation, attempt
+                    ));
+                    succeeded = true;
+                    break;
+                }
+                Err(err) => {
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: dock replay failed session_generation={} dock_target_generation={} replay_attempt={} err={}",
+                        session_generation, current_target.generation, attempt, err
+                    ));
+                    last_error = Some(err);
+                    if attempt < DOCK_REPLAY_MAX_ATTEMPTS {
+                        tokio::time::sleep(DOCK_REPLAY_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        if succeeded {
+            {
+                let mut guard = dock_replay_target_cell().lock().await;
+                if matches!(*guard, Some(target) if target.generation == current_target.generation)
+                {
+                    *guard = None;
+                }
+            }
+
+            let maybe_next = {
+                let guard = dock_replay_target_cell().lock().await;
+                *guard
+            };
+            if let Some(next_target) = maybe_next {
+                if next_target.generation != current_target.generation {
+                    continue;
+                }
+            }
+            return Ok(());
+        }
+
+        let maybe_next = {
+            let guard = dock_replay_target_cell().lock().await;
+            *guard
+        };
+        if let Some(next_target) = maybe_next {
+            if next_target.generation != current_target.generation {
+                let _ = logger::append_line(format!(
+                    "rust-daemon: dock replay switching to newer target generation {} from {}",
+                    next_target.generation, current_target.generation
+                ));
+                continue;
+            }
+        }
+
+        return Err(last_error.unwrap_or_else(|| "unknown dock replay error".to_string()));
+    }
+}
+
+pub(crate) async fn forward_session_command(
+    state: &Arc<RwLock<RuntimeState>>,
+    command: SessionCommand,
+) -> Result<(), String> {
+    match request_session(state.clone(), command, true).await? {
+        SessionResponse::Ack => Ok(()),
+        SessionResponse::Error { message } => Err(message),
+        SessionResponse::DisplayLayout { .. } => {
+            Err("Unexpected display-layout response for command request".into())
+        }
+    }
+}
+
+pub(crate) async fn forward_or_queue_dock_mode(
+    state: &Arc<RwLock<RuntimeState>>,
+    attached: bool,
+    scale: f64,
+) -> Result<(), String> {
+    replay_current_dock_mode(state, attached, scale).await
+}
+
+pub(crate) async fn session_display_layout(
+    state: Arc<RwLock<RuntimeState>>,
+) -> Option<DisplayLayout> {
+    match request_session(state, SessionCommand::GetDisplayLayout, true).await {
+        Ok(SessionResponse::DisplayLayout { layout }) => Some(layout),
+        _ => None,
+    }
+}
+
+async fn apply_orientation(
+    state: &Arc<RwLock<RuntimeState>>,
+    orientation: Orientation,
+) -> DaemonResponse {
+    match forward_session_command(
+        state,
+        SessionCommand::SetOrientation {
+            orientation: orientation.clone(),
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            let mut guard = state.write().await;
+            guard.status.orientation = orientation;
+            let _ = logger::append_line(format!(
+                "rust-daemon: applied orientation -> {:?}",
+                guard.status.orientation
+            ));
+            guard.touch();
+            persist_state(&guard);
+            DaemonResponse::Ack
+        }
+        Err(message) => DaemonResponse::Error { message },
+    }
+}
+
+async fn apply_display_layout_request(
+    state: &Arc<RwLock<RuntimeState>>,
+    layout: DisplayLayout,
+) -> DaemonResponse {
+    match forward_session_command(
+        state,
+        SessionCommand::ApplyDisplayLayout {
+            layout: layout.clone(),
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            let mut guard = state.write().await;
+            crate::runtime::probe::apply_layout_to_status(&mut guard.status, Some(&layout));
+            let _ = logger::append_line(format!(
+                "rust-daemon: applied display layout with {} displays",
+                guard.status.monitor_count
+            ));
+            guard.touch();
+            persist_state(&guard);
+            DaemonResponse::Ack
+        }
+        Err(message) => DaemonResponse::Error { message },
+    }
+}
+
+async fn request_session(
+    state: Arc<RwLock<RuntimeState>>,
+    command: SessionCommand,
+    disconnect_on_failure: bool,
+) -> Result<SessionResponse, String> {
+    let is_dock_mode_command = matches!(command, SessionCommand::SetDockMode { .. });
+    let timeout_for_command = session_timeout_for_command(&command);
+    let disconnect_on_timeout = disconnect_on_failure && should_disconnect_on_timeout(&command);
+
+    let socket_path = {
+        let guard = state.read().await;
+        guard
+            .session_agent
+            .socket_path
+            .clone()
+            .ok_or_else(|| "No session agent registered".to_string())?
+    };
+
+    let stream = match timeout(timeout_for_command, UnixStream::connect(&socket_path)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            if disconnect_on_failure {
+                mark_session_agent_disconnected(
+                    &state,
+                    &format!("Failed to connect to session agent: {e}"),
+                )
+                .await;
+            }
+            return Err(format!("Failed to connect to session agent: {e}"));
+        }
+        Err(_) => {
+            if disconnect_on_timeout {
+                mark_session_agent_disconnected(&state, "Timed out connecting to session agent")
+                    .await;
+            }
+            return Err("Timed out connecting to session agent".to_string());
+        }
+    };
+    let (reader, mut writer) = stream.into_split();
+
+    let line = serde_json::to_string(&Envelope::new(command))
+        .map_err(|e| format!("Failed to encode session command: {e}"))?;
+    if let Err(e) = timeout(timeout_for_command, writer.write_all(line.as_bytes()))
+        .await
+        .map_err(|_| "Timed out writing session command".to_string())?
+    {
+        if disconnect_on_failure {
+            mark_session_agent_disconnected(
+                &state,
+                &format!("Failed to write session command: {e}"),
+            )
+            .await;
+        }
+        return Err(format!("Failed to write session command: {e}"));
+    }
+    if let Err(e) = timeout(timeout_for_command, writer.write_all(b"\n"))
+        .await
+        .map_err(|_| "Timed out terminating session command".to_string())?
+    {
+        if disconnect_on_failure {
+            mark_session_agent_disconnected(
+                &state,
+                &format!("Failed to terminate session command: {e}"),
+            )
+            .await;
+        }
+        return Err(format!("Failed to terminate session command: {e}"));
+    }
+
+    let mut lines = BufReader::new(reader).lines();
+    let reply = match timeout(timeout_for_command, lines.next_line()).await {
+        Err(_) => {
+            if is_dock_mode_command && disconnect_on_failure {
+                let probe_ok = probe_session_agent(socket_path.as_str()).await;
+                if probe_ok {
+                    SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+                    let _ = logger::append_line(
+                        "rust-daemon: session timeout recovered by probe disconnect_reason_class=timeout_probe_recovered"
+                            .to_string(),
+                    );
+                } else {
+                    let streak = SESSION_TIMEOUT_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: session timeout probe failed disconnect_reason_class=timeout_unhealthy_probe streak={} threshold={}",
+                        streak, SESSION_TIMEOUT_DISCONNECT_THRESHOLD
+                    ));
+                    if should_disconnect_after_timeout_streak(streak) {
+                        mark_session_agent_disconnected(
+                            &state,
+                            "Timed out waiting for session response (timeout_unhealthy_probe)",
+                        )
+                        .await;
+                        SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+                    }
+                }
+            } else if disconnect_on_timeout {
+                mark_session_agent_disconnected(&state, "Timed out waiting for session response")
+                    .await;
+            }
+            return Err("Timed out waiting for session response".to_string());
+        }
+        Ok(Ok(Some(reply))) => reply,
+        Ok(Ok(None)) => {
+            if disconnect_on_failure {
+                mark_session_agent_disconnected(&state, "Session agent closed before replying")
+                    .await;
+            }
+            return Err("Session agent closed before replying".to_string());
+        }
+        Ok(Err(e)) => {
+            if disconnect_on_failure {
+                mark_session_agent_disconnected(
+                    &state,
+                    &format!("Failed to read session response: {e}"),
+                )
+                .await;
+            }
+            return Err(format!("Failed to read session response: {e}"));
+        }
+    };
+
+    let envelope: Envelope<SessionResponse> =
+        serde_json::from_str(&reply).map_err(|e| format!("Invalid session response JSON: {e}"))?;
+
+    SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+    Ok(envelope.payload)
+}
+
+fn session_timeout_for_command(command: &SessionCommand) -> Duration {
+    match command {
+        SessionCommand::SetDockMode { .. } => SESSION_COMMAND_TIMEOUT_DOCK_MODE,
+        _ => SESSION_COMMAND_TIMEOUT_DEFAULT,
+    }
+}
+
+fn should_disconnect_on_timeout(command: &SessionCommand) -> bool {
+    !matches!(command, SessionCommand::SetDockMode { .. })
+}
+
+fn should_disconnect_after_timeout_streak(streak: usize) -> bool {
+    streak >= SESSION_TIMEOUT_DISCONNECT_THRESHOLD
+}
+
+async fn probe_session_agent(socket_path: &str) -> bool {
+    let stream = match timeout(
+        SESSION_COMMAND_TIMEOUT_PROBE,
+        UnixStream::connect(socket_path),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        _ => return false,
+    };
+    let (reader, mut writer) = stream.into_split();
+
+    let line = match serde_json::to_string(&Envelope::new(SessionCommand::GetDisplayLayout)) {
+        Ok(line) => line,
+        Err(_) => return false,
+    };
+
+    if timeout(
+        SESSION_COMMAND_TIMEOUT_PROBE,
+        writer.write_all(line.as_bytes()),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    if writer.write_all(b"\n").await.is_err() {
+        return false;
+    }
+
+    let mut lines = BufReader::new(reader).lines();
+    match timeout(SESSION_COMMAND_TIMEOUT_PROBE, lines.next_line()).await {
+        Ok(Ok(Some(reply))) => serde_json::from_str::<Envelope<SessionResponse>>(&reply).is_ok(),
+        _ => false,
+    }
+}
+
+async fn mark_session_agent_disconnected(state: &Arc<RwLock<RuntimeState>>, reason: &str) {
+    let mut guard = state.write().await;
+    let was_connected = guard.session_agent.connected || guard.status.service_active;
+    guard.session_agent = Default::default();
+    guard.status.service_active = false;
+    if was_connected {
+        guard.recent_events.push(HardwareEvent::warning(
+            EventCategory::Service,
+            format!("Session agent disconnected: {reason}"),
+            "rust-daemon",
+        ));
+    }
+    guard.touch();
+    persist_state(&guard);
+    let _ = logger::append_line(format!(
+        "rust-daemon: session agent disconnected: {}",
+        reason
+    ));
+    if let Err(err) = send_runtime_notification_direct(
+        "Zenbook Duo Runtime Error",
+        &format!("Session agent disconnected: {reason}"),
+    ) {
+        log::warn!("failed to send direct disconnect notification: {err}");
+    }
+}
+
+pub(crate) async fn notify_runtime_error(
+    state: &Arc<RwLock<RuntimeState>>,
+    title: &str,
+    message: &str,
+) {
+    if !should_notify_runtime_error(title, message) {
+        return;
+    }
+
+    if !should_emit_runtime_notification(state, title, message).await {
+        return;
+    }
+
+    if let Err(err) = send_runtime_notification_via_session(state, title, message).await {
+        log::warn!("failed to send runtime notification via session agent: {err}");
+        if let Err(fallback_err) = send_runtime_notification_direct(title, message) {
+            log::warn!("failed to send runtime notification directly: {fallback_err}");
+        }
+    }
+}
+
+fn should_notify_runtime_error(title: &str, message: &str) -> bool {
+    if title != "Zenbook Duo Runtime Error" {
+        return true;
+    }
+
+    message != "Lifecycle dock refresh skipped: No session agent registered"
+}
+
+async fn should_emit_runtime_notification(
+    state: &Arc<RwLock<RuntimeState>>,
+    title: &str,
+    message: &str,
+) -> bool {
+    let key = format!("{title}\n{message}");
+    let now = Utc::now();
+    let mut guard = state.write().await;
+    if let Some(last) = &guard.last_runtime_notification {
+        if last.key == key && now - last.emitted_at < ChronoDuration::seconds(30) {
+            return false;
+        }
+    }
+    guard.last_runtime_notification = Some(crate::runtime::state::RuntimeNotificationState {
+        key,
+        emitted_at: now,
+    });
+    persist_state(&guard);
+    true
+}
+
+async fn send_runtime_notification_via_session(
+    state: &Arc<RwLock<RuntimeState>>,
+    title: &str,
+    message: &str,
+) -> Result<(), String> {
+    match request_session(
+        state.clone(),
+        SessionCommand::ShowNotification {
+            title: title.to_string(),
+            message: message.to_string(),
+            urgent: true,
+        },
+        false,
+    )
+    .await?
+    {
+        SessionResponse::Ack => Ok(()),
+        SessionResponse::Error { message } => Err(message),
+        SessionResponse::DisplayLayout { .. } => {
+            Err("Unexpected display-layout response for notification request".into())
+        }
+    }
+}
+
+fn send_runtime_notification_direct(title: &str, message: &str) -> Result<(), String> {
+    let target_user = std::env::var("ZENBOOK_DUO_USER")
+        .map_err(|_| "ZENBOOK_DUO_USER is not set for runtime notifications".to_string())?;
+    let target_uid = std::env::var("ZENBOOK_DUO_UID")
+        .map_err(|_| "ZENBOOK_DUO_UID is not set for runtime notifications".to_string())?;
+    let runtime_dir = format!("/run/user/{target_uid}");
+    let bus_address = format!("unix:path={runtime_dir}/bus");
+
+    let status = Command::new("sudo")
+        .args(["-u", &target_user, "env"])
+        .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+        .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus_address}"))
+        .args([
+            "notify-send",
+            "-a",
+            "Zenbook Duo Control",
+            "-u",
+            "critical",
+            "-i",
+            "dialog-error",
+            title,
+            message,
+        ])
+        .status()
+        .map_err(|e| format!("Failed to launch runtime notification: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Runtime notification exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::protocol::SessionBackend;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    static TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_serial() -> &'static Mutex<()> {
+        TEST_SERIAL.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn reset_daemon_test_state() {
+        {
+            let mut guard = dock_replay_target_cell().lock().await;
+            *guard = None;
+        }
+        DOCK_TARGET_GENERATION.store(0, Ordering::Relaxed);
+        SESSION_GENERATION.store(0, Ordering::Relaxed);
+        SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn apply_orientation_does_not_deadlock_and_updates_state() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("orientation");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            match envelope.payload {
+                SessionCommand::SetOrientation { orientation } => {
+                    assert_eq!(orientation, Orientation::Left);
+                }
+                other => panic!("unexpected session command: {other:?}"),
+            }
+            let reply =
+                serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+            writer.write_all(reply.as_bytes()).await.expect("write ack");
+            writer.write_all(b"\n").await.expect("terminate ack");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+        }
+
+        let response = timeout(
+            Duration::from_secs(1),
+            apply_orientation(&state, Orientation::Left),
+        )
+        .await
+        .expect("orientation request should not hang");
+
+        assert!(matches!(response, DaemonResponse::Ack));
+        assert_eq!(state.read().await.status.orientation, Orientation::Left);
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn session_registration_replays_current_detached_dock_state() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("register-detached");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            match envelope.payload {
+                SessionCommand::SetDockMode { attached, scale } => {
+                    assert!(!attached);
+                    assert_eq!(scale, 1.66);
+                }
+                other => panic!("unexpected session command: {other:?}"),
+            }
+            let reply =
+                serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+            writer.write_all(reply.as_bytes()).await.expect("write ack");
+            writer.write_all(b"\n").await.expect("terminate ack");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.status.keyboard_attached = false;
+            guard.settings.default_scale = 1.66;
+        }
+
+        handle_session_registration(
+            &state,
+            "test-session".into(),
+            SessionBackend::Gnome,
+            socket_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("registration should succeed");
+
+        let guard = state.read().await;
+        assert!(guard.session_agent.connected);
+        assert_eq!(
+            guard.session_agent.session_id.as_deref(),
+            Some("test-session")
+        );
+        drop(guard);
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn session_registration_acknowledges_before_dock_replay_completes() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("register-async");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.status.keyboard_attached = true;
+            guard.settings.default_scale = 1.5;
+        }
+
+        timeout(
+            Duration::from_millis(500),
+            handle_session_registration(
+                &state,
+                "test-session".into(),
+                SessionBackend::Niri,
+                socket_path.to_string_lossy().into_owned(),
+            ),
+        )
+        .await
+        .expect("registration should return before replay finishes")
+        .expect("registration should succeed");
+
+        let (stream, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("replay should connect after registration")
+            .expect("accept replay connection");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await
+            .expect("read replay request")
+            .expect("session request line");
+        let envelope: Envelope<SessionCommand> =
+            serde_json::from_str(&line).expect("decode session request");
+        match envelope.payload {
+            SessionCommand::SetDockMode { attached, scale } => {
+                assert!(attached);
+                assert_eq!(scale, 1.5);
+            }
+            other => panic!("unexpected session command: {other:?}"),
+        }
+        let reply =
+            serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+        writer.write_all(reply.as_bytes()).await.expect("write ack");
+        writer.write_all(b"\n").await.expect("terminate ack");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(state.read().await.session_agent.connected);
+
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn session_registration_succeeds_even_if_dock_replay_fails() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("register-fail");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            match envelope.payload {
+                SessionCommand::SetDockMode { attached, scale } => {
+                    assert!(attached);
+                    assert_eq!(scale, 2.0);
+                }
+                other => panic!("unexpected session command: {other:?}"),
+            }
+            let reply = serde_json::to_string(&Envelope::new(SessionResponse::Error {
+                message: "display replay failed".into(),
+            }))
+            .expect("encode error");
+            writer
+                .write_all(reply.as_bytes())
+                .await
+                .expect("write error");
+            writer.write_all(b"\n").await.expect("terminate error");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.status.keyboard_attached = true;
+            guard.settings.default_scale = 2.0;
+        }
+
+        let result = handle_session_registration(
+            &state,
+            "test-session".into(),
+            SessionBackend::Kde,
+            socket_path.to_string_lossy().into_owned(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "registration should ignore dock replay errors"
+        );
+        assert!(state.read().await.session_agent.connected);
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn session_registration_replays_current_attached_dock_state() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("register-attached");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            match envelope.payload {
+                SessionCommand::SetDockMode { attached, scale } => {
+                    assert!(attached);
+                    assert_eq!(scale, 1.25);
+                }
+                other => panic!("unexpected session command: {other:?}"),
+            }
+            let reply =
+                serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+            writer.write_all(reply.as_bytes()).await.expect("write ack");
+            writer.write_all(b"\n").await.expect("terminate ack");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.status.keyboard_attached = true;
+            guard.settings.default_scale = 1.25;
+        }
+
+        handle_session_registration(
+            &state,
+            "test-session".into(),
+            SessionBackend::Niri,
+            socket_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("registration should succeed");
+
+        assert!(state.read().await.session_agent.connected);
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_error_notification_forwards_show_notification_command() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("notify-runtime-error");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            match envelope.payload {
+                SessionCommand::ShowNotification {
+                    title,
+                    message,
+                    urgent,
+                } => {
+                    assert_eq!(title, "Zenbook Duo Runtime Error");
+                    assert_eq!(message, "Dock-mode replay skipped");
+                    assert!(urgent);
+                }
+                other => panic!("unexpected session command: {other:?}"),
+            }
+            let reply =
+                serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+            writer.write_all(reply.as_bytes()).await.expect("write ack");
+            writer.write_all(b"\n").await.expect("terminate ack");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+        }
+
+        notify_runtime_error(
+            &state,
+            "Zenbook Duo Runtime Error",
+            "Dock-mode replay skipped",
+        )
+        .await;
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_error_notification_suppresses_duplicate_messages() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("notify-runtime-dedupe");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept first test client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read first request")
+                .expect("first session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode first session request");
+            assert!(matches!(
+                envelope.payload,
+                SessionCommand::ShowNotification { .. }
+            ));
+            let reply =
+                serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("encode ack");
+            writer.write_all(reply.as_bytes()).await.expect("write ack");
+            writer.write_all(b"\n").await.expect("terminate ack");
+
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .expect_err("duplicate notification should be suppressed");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+        }
+
+        notify_runtime_error(
+            &state,
+            "Zenbook Duo Runtime Error",
+            "Session agent disconnected",
+        )
+        .await;
+        notify_runtime_error(
+            &state,
+            "Zenbook Duo Runtime Error",
+            "Session agent disconnected",
+        )
+        .await;
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn no_session_agent_registered_is_not_notifiable() {
+        assert!(!should_notify_runtime_error(
+            "Zenbook Duo Runtime Error",
+            "Lifecycle dock refresh skipped: No session agent registered",
+        ));
+    }
+
+    #[test]
+    fn real_runtime_errors_remain_notifiable() {
+        assert!(should_notify_runtime_error(
+            "Zenbook Duo Runtime Error",
+            "Dock-mode policy action failed: Timed out waiting for session response",
+        ));
+    }
+
+    #[test]
+    fn set_dock_mode_uses_extended_session_timeout() {
+        let timeout = session_timeout_for_command(&SessionCommand::SetDockMode {
+            attached: true,
+            scale: 1.66,
+        });
+        assert_eq!(timeout, SESSION_COMMAND_TIMEOUT_DOCK_MODE);
+    }
+
+    #[test]
+    fn non_dock_commands_keep_default_timeout() {
+        let timeout = session_timeout_for_command(&SessionCommand::GetDisplayLayout);
+        assert_eq!(timeout, SESSION_COMMAND_TIMEOUT_DEFAULT);
+    }
+
+    #[test]
+    fn set_dock_mode_timeout_does_not_disconnect_session_agent() {
+        assert!(!should_disconnect_on_timeout(&SessionCommand::SetDockMode {
+            attached: false,
+            scale: 1.66,
+        }));
+        assert!(should_disconnect_on_timeout(&SessionCommand::GetDisplayLayout));
+    }
+
+    #[test]
+    fn disconnect_requires_timeout_streak_threshold() {
+        assert!(!should_disconnect_after_timeout_streak(1));
+        assert!(!should_disconnect_after_timeout_streak(2));
+        assert!(should_disconnect_after_timeout_streak(3));
+    }
+
+    #[tokio::test]
+    async fn dock_target_queue_keeps_latest_generation() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        {
+            let mut guard = dock_replay_target_cell().lock().await;
+            *guard = None;
+        }
+        DOCK_TARGET_GENERATION.store(0, Ordering::Relaxed);
+
+        let first = set_dock_replay_target(true, 1.25).await;
+        let second = set_dock_replay_target(false, 1.66).await;
+        assert!(second.generation > first.generation);
+
+        let queued = { *dock_replay_target_cell().lock().await };
+        let queued = queued.expect("expected queued dock target");
+        assert_eq!(queued.attached, second.attached);
+        assert!((queued.scale - second.scale).abs() < f64::EPSILON);
+        assert_eq!(queued.generation, second.generation);
+    }
+
+    #[tokio::test]
+    async fn dock_replay_retries_and_stops_after_success() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("dock-replay-retry");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (stream, _) = listener.accept().await.expect("accept test session client");
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("read test request")
+                    .expect("session request line");
+                let envelope: Envelope<SessionCommand> =
+                    serde_json::from_str(&line).expect("decode session request");
+                assert!(matches!(
+                    envelope.payload,
+                    SessionCommand::SetDockMode { .. }
+                ));
+
+                if attempt == 1 {
+                    let reply = serde_json::to_string(&Envelope::new(SessionResponse::Error {
+                        message: "not ready".into(),
+                    }))
+                    .expect("encode error");
+                    writer
+                        .write_all(reply.as_bytes())
+                        .await
+                        .expect("write error");
+                    writer.write_all(b"\n").await.expect("terminate error");
+                } else {
+                    let reply =
+                        serde_json::to_string(&Envelope::new(SessionResponse::Ack)).expect("ack");
+                    writer.write_all(reply.as_bytes()).await.expect("write ack");
+                    writer.write_all(b"\n").await.expect("terminate ack");
+                }
+            }
+
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .expect_err("dock replay should stop once an attempt succeeds");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+        }
+
+        replay_current_dock_mode(&state, true, 1.66)
+            .await
+            .expect("dock replay should eventually succeed");
+
+        server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    fn unique_test_socket_path(label: &str) -> PathBuf {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("zenbook-duo-{label}-{nanos}-{id}.sock"))
+    }
+}
