@@ -5,6 +5,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+const DISPLAY_COMMAND_TIMEOUT_SECS: u64 = 2;
+
 fn format_refresh_rate(refresh_rate: f64) -> String {
     let rounded = (refresh_rate * 1000.0).round() / 1000.0;
     let mut value = format!("{rounded:.3}");
@@ -110,10 +112,9 @@ pub fn get_display_layout() -> Result<DisplayLayout, String> {
 }
 
 fn get_gnome_display_layout() -> Result<DisplayLayout, String> {
-    let output = Command::new("gdctl")
-        .arg("show")
-        .output()
-        .map_err(|e| format!("Failed to run gdctl: {e}"))?;
+    let output =
+        run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
+            .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -482,9 +483,7 @@ fn apply_gnome_display_layout(layout: &DisplayLayout) -> Result<(), String> {
         }
     }
 
-    let output = Command::new("gdctl")
-        .args(&args)
-        .output()
+    let output = run_command_output_with_timeout("gdctl", &args, DISPLAY_COMMAND_TIMEOUT_SECS)
         .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
     if !output.status.success() {
@@ -850,15 +849,47 @@ fn detect_backend() -> DisplayBackend {
 }
 
 fn run_command<S: AsRef<str>>(program: &str, args: &[S]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args.iter().map(|arg| arg.as_ref()))
-        .output()
+    let output = run_command_output_with_timeout(program, args, DISPLAY_COMMAND_TIMEOUT_SECS)
         .map_err(|e| format!("Failed to run {program}: {e}"))?;
 
     if output.status.success() {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn run_command_output_with_timeout<S: AsRef<str>>(
+    program: &str,
+    args: &[S],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let args_vec = args
+        .iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let timeout_arg = format!("{timeout_secs}s");
+
+    match Command::new("timeout")
+        .arg(&timeout_arg)
+        .arg(program)
+        .args(&args_vec)
+        .output()
+    {
+        Ok(output) => {
+            if output.status.code() == Some(124) {
+                return Err(format!(
+                    "{program} timed out after {timeout_secs}s ({})",
+                    args_vec.join(" ")
+                ));
+            }
+            Ok(output)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Command::new(program)
+            .args(&args_vec)
+            .output()
+            .map_err(|e| format!("Failed to run {program}: {e}")),
+        Err(err) => Err(format!("Failed to run timeout wrapper for {program}: {err}")),
     }
 }
 
@@ -885,10 +916,9 @@ fn gnome_scale() -> Result<f64, String> {
 }
 
 fn gnome_logical_monitor_count() -> Result<usize, String> {
-    let output = Command::new("gdctl")
-        .arg("show")
-        .output()
-        .map_err(|e| format!("Failed to run gdctl: {e}"))?;
+    let output =
+        run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
+            .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(

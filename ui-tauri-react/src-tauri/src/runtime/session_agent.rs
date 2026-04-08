@@ -10,12 +10,16 @@ use evdev::{AbsoluteAxisType, Device, EventType};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
+use tokio::time::timeout;
 
 use crate::ipc::protocol::{
     DaemonRequest, DaemonResponse, Envelope, SessionBackend, SessionCommand, SessionResponse,
 };
 use crate::models::Orientation;
 use crate::runtime::{paths, state::RuntimeState};
+
+const DOCK_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+const DOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run() -> Result<(), String> {
     ensure_user_runtime_dir()?;
@@ -128,7 +132,7 @@ async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
                 }
             }
             SessionCommand::SetDockMode { attached, scale } => {
-                match apply_dock_mode(attached, scale) {
+                match apply_dock_mode(attached, scale).await {
                     Ok(()) => SessionResponse::Ack,
                     Err(message) => SessionResponse::Error { message },
                 }
@@ -348,8 +352,13 @@ async fn wait_for_ready_backend() -> Result<SessionBackend, String> {
     }
 }
 
-fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
-    let backend = detect_ready_backend();
+async fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
+    let backend_hint = detect_backend();
+    let backend = if backend_hint == SessionBackend::Unknown {
+        detect_ready_backend()
+    } else {
+        backend_hint
+    };
     let started = Instant::now();
     let _ = crate::runtime::logger::append_line(format!(
         "session-agent: applying dock mode (backend={:?}, attached={}, scale={:.3})",
@@ -357,7 +366,7 @@ fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
     ));
 
     let result = match backend {
-        SessionBackend::Gnome => apply_gnome_dock_mode(attached, scale),
+        SessionBackend::Gnome => apply_gnome_dock_mode(attached, scale).await,
         SessionBackend::Kde => apply_kde_dock_mode(attached),
         SessionBackend::Niri => apply_niri_dock_mode(attached),
         SessionBackend::Unknown => Err("Unsupported session backend for dock mode".into()),
@@ -392,15 +401,15 @@ fn apply_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_gnome_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
+async fn apply_gnome_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
     let args = build_gnome_dock_mode_args(attached, scale);
     if !attached {
-        run_command("gdctl", &args)?;
-        return verify_gnome_dock_mode(attached);
+        run_command_async("gdctl", &args, DOCK_COMMAND_TIMEOUT).await?;
+        return verify_gnome_dock_mode(attached).await;
     }
 
-    match run_command("gdctl", &args) {
-        Ok(()) => verify_gnome_dock_mode(attached),
+    match run_command_async("gdctl", &args, DOCK_COMMAND_TIMEOUT).await {
+        Ok(()) => verify_gnome_dock_mode(attached).await,
         Err(primary_err) => {
             // Older mutter/gdctl combinations may reject explicit secondary off.
             // Keep a compatibility fallback to the historical attached layout call.
@@ -409,8 +418,8 @@ fn apply_gnome_dock_mode(attached: bool, scale: f64) -> Result<(), String> {
                 "gnome attached dock mode with explicit eDP-2 off failed ({}), trying fallback",
                 primary_err
             );
-            run_command("gdctl", &fallback_args)?;
-            verify_gnome_dock_mode(attached)
+            run_command_async("gdctl", &fallback_args, DOCK_COMMAND_TIMEOUT).await?;
+            verify_gnome_dock_mode(attached).await
         }
     }
 }
@@ -472,10 +481,9 @@ fn build_gnome_attached_fallback_args(scale: f64) -> Vec<String> {
     ]
 }
 
-fn verify_gnome_dock_mode(attached: bool) -> Result<(), String> {
-    let output = Command::new("gdctl")
-        .arg("show")
-        .output()
+async fn verify_gnome_dock_mode(attached: bool) -> Result<(), String> {
+    let output = run_command_capture_async("gdctl", &["show"], DOCK_VERIFY_TIMEOUT)
+        .await
         .map_err(|e| format!("Failed to run gdctl verification: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -638,6 +646,50 @@ fn run_command<S: AsRef<str>>(program: &str, args: &[S]) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+async fn run_command_async<S: AsRef<str>>(
+    program: &str,
+    args: &[S],
+    timeout_duration: Duration,
+) -> Result<(), String> {
+    let output = run_command_capture_async(program, args, timeout_duration).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+async fn run_command_capture_async<S: AsRef<str>>(
+    program: &str,
+    args: &[S],
+    timeout_duration: Duration,
+) -> Result<std::process::Output, String> {
+    let mut command = TokioCommand::new(program);
+    command.args(args.iter().map(|arg| arg.as_ref()));
+    command.kill_on_drop(true);
+    let output_future = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match timeout(timeout_duration, output_future).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("Failed to run {program}: {e}")),
+        Err(_) => {
+            let args_rendered = args
+                .iter()
+                .map(|arg| arg.as_ref().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Err(format!(
+                "{program} timed out after {}s (args: {})",
+                timeout_duration.as_secs(),
+                args_rendered
+            ))
+        }
     }
 }
 

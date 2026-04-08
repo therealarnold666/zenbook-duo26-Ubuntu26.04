@@ -12,7 +12,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 use crate::ipc::protocol::{
     DaemonRequest, DaemonResponse, Envelope, LifecyclePhase, SessionCommand, SessionResponse,
@@ -30,18 +30,47 @@ const SESSION_COMMAND_TIMEOUT_PROBE: Duration = Duration::from_millis(1200);
 const SESSION_TIMEOUT_DISCONNECT_THRESHOLD: usize = 3;
 const DOCK_REPLAY_MAX_ATTEMPTS: usize = 3;
 const DOCK_REPLAY_RETRY_DELAY: Duration = Duration::from_millis(800);
+const STARTUP_GRACE_WINDOW: Duration = Duration::from_secs(5);
+const STARTUP_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DOCK_TARGET_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SESSION_TIMEOUT_STREAK: AtomicUsize = AtomicUsize::new(0);
 static DOCK_REPLAY_TARGET: OnceLock<Mutex<Option<DockReplayTarget>>> = OnceLock::new();
 static DOCK_REPLAY_EXECUTOR: OnceLock<Mutex<()>> = OnceLock::new();
+static STARTUP_REPLAY_STATE: OnceLock<Mutex<StartupReplayState>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct DockReplayTarget {
     attached: bool,
     scale: f64,
     generation: u64,
+}
+
+#[derive(Debug)]
+struct StartupReplayState {
+    grace_until: Option<Instant>,
+    replay_pending: bool,
+    replay_done: bool,
+    replay_in_progress: bool,
+}
+
+impl Default for StartupReplayState {
+    fn default() -> Self {
+        Self {
+            grace_until: None,
+            replay_pending: false,
+            replay_done: false,
+            replay_in_progress: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupReplayDecision {
+    Start,
+    InProgress,
+    NotPending,
 }
 
 pub async fn run() -> Result<(), String> {
@@ -119,6 +148,109 @@ fn dock_replay_target_cell() -> &'static Mutex<Option<DockReplayTarget>> {
 
 fn dock_replay_executor_lock() -> &'static Mutex<()> {
     DOCK_REPLAY_EXECUTOR.get_or_init(|| Mutex::new(()))
+}
+
+fn startup_replay_state_cell() -> &'static Mutex<StartupReplayState> {
+    STARTUP_REPLAY_STATE.get_or_init(|| Mutex::new(StartupReplayState::default()))
+}
+
+async fn mark_startup_replay_pending_from_boot() {
+    let mut guard = startup_replay_state_cell().lock().await;
+    guard.replay_pending = true;
+    guard.replay_done = false;
+    guard.replay_in_progress = false;
+    guard.grace_until = None;
+}
+
+async fn startup_replay_decision_on_registration() -> StartupReplayDecision {
+    let mut guard = startup_replay_state_cell().lock().await;
+    if guard.replay_in_progress {
+        return StartupReplayDecision::InProgress;
+    }
+    if !guard.replay_pending || guard.replay_done {
+        return StartupReplayDecision::NotPending;
+    }
+
+    guard.replay_in_progress = true;
+    guard.grace_until = Some(Instant::now() + STARTUP_GRACE_WINDOW);
+    StartupReplayDecision::Start
+}
+
+async fn finish_startup_replay() {
+    let mut guard = startup_replay_state_cell().lock().await;
+    guard.replay_pending = false;
+    guard.replay_done = true;
+    guard.replay_in_progress = false;
+    guard.grace_until = None;
+}
+
+async fn startup_grace_active_for_display_probe() -> bool {
+    let now = Instant::now();
+    let guard = startup_replay_state_cell().lock().await;
+    guard.replay_in_progress
+        && !guard.replay_done
+        && guard
+            .grace_until
+            .map(|deadline| now < deadline)
+            .unwrap_or(false)
+}
+
+async fn wait_startup_session_readiness(state: &Arc<RwLock<RuntimeState>>) -> bool {
+    let deadline = {
+        let guard = startup_replay_state_cell().lock().await;
+        guard.grace_until.unwrap_or_else(Instant::now)
+    };
+
+    loop {
+        let socket_path = {
+            let guard = state.read().await;
+            guard.session_agent.socket_path.clone()
+        };
+        if let Some(socket_path) = socket_path {
+            if probe_session_agent(socket_path.as_str()).await {
+                return true;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(STARTUP_READINESS_POLL_INTERVAL).await;
+    }
+}
+
+async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>, attached: bool, scale: f64) {
+    let ready = wait_startup_session_readiness(&state).await;
+    if !ready {
+        let _ = logger::append_line(
+            "rust-daemon: startup replay readiness probe timed out, running fallback replay"
+                .to_string(),
+        );
+    } else {
+        let _ = logger::append_line(
+            "rust-daemon: startup replay readiness probe succeeded, applying first dock sync"
+                .to_string(),
+        );
+    }
+
+    let command = SessionCommand::SetDockMode { attached, scale };
+    if let Err(err) = forward_session_command(&state, command).await {
+        log::warn!("startup dock replay failed: {err}");
+        notify_runtime_error(
+            &state,
+            "Zenbook Duo Runtime Error",
+            &format!("Startup dock replay skipped: {err}"),
+        )
+        .await;
+        let _ = logger::append_line(format!("rust-daemon: startup dock replay failed: {err}"));
+    } else {
+        let _ = logger::append_line(format!(
+            "rust-daemon: startup dock replay applied (attached={}, scale={})",
+            attached, scale
+        ));
+    }
+
+    finish_startup_replay().await;
 }
 
 async fn set_dock_replay_target(attached: bool, scale: f64) -> DockReplayTarget {
@@ -413,6 +545,15 @@ async fn handle_lifecycle(
                 }
             }
 
+            if matches!(phase, LifecyclePhase::Boot) {
+                mark_startup_replay_pending_from_boot().await;
+                logger::append_line(
+                    "rust-daemon: lifecycle boot marked startup replay pending".to_string(),
+                )
+                .ok();
+                return Ok(());
+            }
+
             match replay_current_dock_mode(state, attached, scale).await {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -459,20 +600,34 @@ async fn handle_session_registration(
         (guard.status.keyboard_attached, guard.settings.default_scale)
     };
 
+    let decision = startup_replay_decision_on_registration().await;
     let state = Arc::clone(state);
     tokio::spawn(async move {
-        if let Err(err) = replay_current_dock_mode(&state, attached, scale).await {
-            log::warn!("session registration dock replay failed: {err}");
-            notify_runtime_error(
-                &state,
-                "Zenbook Duo Runtime Error",
-                &format!("Session registration dock replay skipped: {err}"),
-            )
-            .await;
-            let _ = logger::append_line(format!(
-                "rust-daemon: session registration dock replay skipped: {}",
-                err
-            ));
+        match decision {
+            StartupReplayDecision::Start => {
+                run_startup_replay_once(state, attached, scale).await;
+            }
+            StartupReplayDecision::InProgress => {
+                let _ = logger::append_line(
+                    "rust-daemon: startup replay already in progress; registration replay skipped"
+                        .to_string(),
+                );
+            }
+            StartupReplayDecision::NotPending => {
+                if let Err(err) = replay_current_dock_mode(&state, attached, scale).await {
+                    log::warn!("session registration dock replay failed: {err}");
+                    notify_runtime_error(
+                        &state,
+                        "Zenbook Duo Runtime Error",
+                        &format!("Session registration dock replay skipped: {err}"),
+                    )
+                    .await;
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: session registration dock replay skipped: {}",
+                        err
+                    ));
+                }
+            }
         }
     });
 
@@ -670,8 +825,11 @@ async fn request_session(
     disconnect_on_failure: bool,
 ) -> Result<SessionResponse, String> {
     let is_dock_mode_command = matches!(command, SessionCommand::SetDockMode { .. });
+    let is_display_probe_command = matches!(command, SessionCommand::GetDisplayLayout);
     let timeout_for_command = session_timeout_for_command(&command);
     let disconnect_on_timeout = disconnect_on_failure && should_disconnect_on_timeout(&command);
+    let relax_disconnect_for_startup =
+        is_display_probe_command && startup_grace_active_for_display_probe().await;
 
     let socket_path = {
         let guard = state.read().await;
@@ -695,9 +853,14 @@ async fn request_session(
             return Err(format!("Failed to connect to session agent: {e}"));
         }
         Err(_) => {
-            if disconnect_on_timeout {
+            if disconnect_on_timeout && !relax_disconnect_for_startup {
                 mark_session_agent_disconnected(&state, "Timed out connecting to session agent")
                     .await;
+            } else if disconnect_on_timeout && relax_disconnect_for_startup {
+                let _ = logger::append_line(
+                    "rust-daemon: startup grace active, suppressing disconnect on display probe connect-timeout"
+                        .to_string(),
+                );
             }
             return Err("Timed out connecting to session agent".to_string());
         }
@@ -759,9 +922,14 @@ async fn request_session(
                         SESSION_TIMEOUT_STREAK.store(0, Ordering::Relaxed);
                     }
                 }
-            } else if disconnect_on_timeout {
+            } else if disconnect_on_timeout && !relax_disconnect_for_startup {
                 mark_session_agent_disconnected(&state, "Timed out waiting for session response")
                     .await;
+            } else if disconnect_on_timeout && relax_disconnect_for_startup {
+                let _ = logger::append_line(
+                    "rust-daemon: startup grace active, suppressing disconnect on display probe response-timeout"
+                        .to_string(),
+                );
             }
             return Err("Timed out waiting for session response".to_string());
         }
@@ -997,6 +1165,10 @@ mod tests {
         {
             let mut guard = dock_replay_target_cell().lock().await;
             *guard = None;
+        }
+        {
+            let mut guard = startup_replay_state_cell().lock().await;
+            *guard = StartupReplayState::default();
         }
         DOCK_TARGET_GENERATION.store(0, Ordering::Relaxed);
         SESSION_GENERATION.store(0, Ordering::Relaxed);
@@ -1287,6 +1459,140 @@ mod tests {
         assert!(state.read().await.session_agent.connected);
 
         server.await.expect("join session server");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn boot_pending_registration_runs_single_startup_replay() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        mark_startup_replay_pending_from_boot().await;
+
+        let socket_path = unique_test_socket_path("startup-single");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let mut calls = 0usize;
+            while calls < 2 {
+                let (stream, _) = listener.accept().await.expect("accept test session client");
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("read test request")
+                    .expect("session request line");
+                let envelope: Envelope<SessionCommand> =
+                    serde_json::from_str(&line).expect("decode session request");
+                match envelope.payload {
+                    SessionCommand::GetDisplayLayout => {
+                        calls += 1;
+                        let reply = serde_json::to_string(&Envelope::new(
+                            SessionResponse::DisplayLayout {
+                                layout: DisplayLayout { displays: vec![] },
+                            },
+                        ))
+                        .expect("encode layout");
+                        writer.write_all(reply.as_bytes()).await.expect("write layout");
+                        writer.write_all(b"\n").await.expect("terminate layout");
+                    }
+                    SessionCommand::SetDockMode { attached, scale } => {
+                        assert!(!attached);
+                        assert_eq!(scale, 1.66);
+                        calls += 1;
+                        let reply = serde_json::to_string(&Envelope::new(SessionResponse::Ack))
+                            .expect("encode ack");
+                        writer.write_all(reply.as_bytes()).await.expect("write ack");
+                        writer.write_all(b"\n").await.expect("terminate ack");
+                    }
+                    other => panic!("unexpected session command: {other:?}"),
+                }
+            }
+
+            timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .expect_err("startup replay should only issue one dock command");
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.status.keyboard_attached = false;
+            guard.settings.default_scale = 1.66;
+        }
+
+        handle_session_registration(
+            &state,
+            "startup-session".into(),
+            SessionBackend::Gnome,
+            socket_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect("registration should succeed");
+
+        server.await.expect("join session server");
+        let startup = startup_replay_state_cell().lock().await;
+        assert!(!startup.replay_pending);
+        assert!(startup.replay_done);
+        assert!(!startup.replay_in_progress);
+        drop(startup);
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn startup_display_probe_timeout_does_not_disconnect_session() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("startup-timeout-no-disconnect");
+        let listener = UnixListener::bind(&socket_path).expect("bind test session socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test session client");
+            let (reader, _writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("read test request")
+                .expect("session request line");
+            let envelope: Envelope<SessionCommand> =
+                serde_json::from_str(&line).expect("decode session request");
+            assert!(matches!(envelope.payload, SessionCommand::GetDisplayLayout));
+            tokio::time::sleep(SESSION_COMMAND_TIMEOUT_DEFAULT + Duration::from_millis(200)).await;
+        });
+
+        {
+            let mut startup = startup_replay_state_cell().lock().await;
+            startup.replay_pending = true;
+            startup.replay_done = false;
+            startup.replay_in_progress = true;
+            startup.grace_until = Some(Instant::now() + Duration::from_secs(1));
+        }
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+            guard.status.service_active = true;
+        }
+
+        let result = request_session(state.clone(), SessionCommand::GetDisplayLayout, true).await;
+        assert!(result.is_err(), "request should still fail on timeout");
+        let guard = state.read().await;
+        assert!(
+            guard.session_agent.connected,
+            "startup grace should avoid forced disconnect on display probe timeout"
+        );
+        assert!(
+            guard.status.service_active,
+            "service flag should remain active during startup grace timeout"
+        );
+        drop(guard);
+
+        server.await.expect("join timeout server");
         let _ = fs::remove_file(&socket_path);
     }
 
