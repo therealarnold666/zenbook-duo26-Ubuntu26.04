@@ -1,8 +1,14 @@
 use std::fs;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
 
 use rusb::UsbContext;
+
+use crate::hardware::sysfs;
+use crate::models::ConnectionType;
+
+const FEATURE_REPORT_LEN: usize = 16;
+const HIDIOCSFEATURE_16: libc::c_ulong = 0xC010_4806;
+const HIDIOCGFEATURE_16: libc::c_ulong = 0xC010_4807;
 
 /// USB HID SET_REPORT for keyboard backlight control using rusb.
 ///
@@ -48,13 +54,7 @@ pub fn set_backlight_usb(level: u8) -> Result<(), String> {
         let _ = handle.set_auto_detach_kernel_driver(true);
         let _ = handle.claim_interface(interface as u8);
 
-        // Build the HID SET_REPORT payload
-        let mut data = [0u8; 16];
-        data[0] = 0x5A; // Report ID
-        data[1] = 0xBA;
-        data[2] = 0xC5;
-        data[3] = 0xC4;
-        data[4] = level;
+        let data = build_backlight_report(level);
 
         // HID SET_REPORT: bmRequestType=0x21, bRequest=0x09
         // wValue = 0x0300 | report_id = 0x035A
@@ -77,35 +77,68 @@ pub fn set_backlight_usb(level: u8) -> Result<(), String> {
 
 /// Bluetooth HID Feature Report for keyboard backlight using ioctl HIDIOCSFEATURE.
 pub fn set_backlight_bluetooth(level: u8) -> Result<(), String> {
-    let level = level.min(3);
+    try_bluetooth_backlight(level)
+}
 
-    // Find the hidraw device for the Zenbook keyboard
-    let hidraw_path = find_bt_hidraw()?;
+/// Set backlight, preferring the active keyboard transport.
+pub fn set_backlight(level: u8) -> Result<(), String> {
+    let bt_first = !matches!(sysfs::detect_connection_type(), ConnectionType::Usb);
+    if bt_first {
+        set_backlight_bluetooth(level).or_else(|bt_err| {
+            set_backlight_usb(level).map_err(|usb_err| both_failed(usb_err, bt_err))
+        })
+    } else {
+        set_backlight_usb(level).or_else(|usb_err| {
+            set_backlight_bluetooth(level).map_err(|bt_err| both_failed(usb_err, bt_err))
+        })
+    }
+}
 
+fn try_bluetooth_backlight(level: u8) -> Result<(), String> {
+    for attempt in 0..2 {
+        let paths = list_bluetooth_hidraw_paths();
+        if paths.is_empty() {
+            return Err("Bluetooth hidraw device not found".into());
+        }
+
+        let mut errors = Vec::new();
+        for path in &paths {
+            match set_backlight_on_hidraw(path, level) {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(format!("{path}: {err}")),
+            }
+        }
+
+        if attempt == 0 && reset_bluetooth_keyboard_hid().is_ok() {
+            continue;
+        }
+
+        return Err(format!("bluetooth hidraw failed ({})", errors.join("; ")));
+    }
+
+    unreachable!()
+}
+
+fn set_backlight_on_hidraw(path: &str, level: u8) -> Result<(), String> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&hidraw_path)
-        .map_err(|e| format!("Failed to open {hidraw_path}: {e}"))?;
+        .open(path)
+        .map_err(|e| format!("Failed to open {path}: {e}"))?;
 
     let fd = file.as_raw_fd();
 
-    // Build the same payload
-    let mut data = [0u8; 16];
-    data[0] = 0x5A;
-    data[1] = 0xBA;
-    data[2] = 0xC5;
-    data[3] = 0xC4;
-    data[4] = level;
+    let mut probe = [0u8; FEATURE_REPORT_LEN];
+    probe[0] = 0x5A;
+    if unsafe { libc::ioctl(fd, HIDIOCGFEATURE_16, probe.as_mut_ptr()) } < 0 {
+        return Err(format!(
+            "HIDIOCGFEATURE probe failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 
-    // HIDIOCSFEATURE = 0xC0104806 + len
-    // This is _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
-    // For 16 bytes: 0xC0104806
-    let hidiocsfeature: libc::c_ulong = 0xC010_4806;
-
-    let ret = unsafe { libc::ioctl(fd, hidiocsfeature, data.as_mut_ptr()) };
-
-    if ret < 0 {
+    let mut data = build_backlight_report(level);
+    if unsafe { libc::ioctl(fd, HIDIOCSFEATURE_16, data.as_mut_ptr()) } < 0 {
         return Err(format!(
             "ioctl HIDIOCSFEATURE failed: {}",
             std::io::Error::last_os_error()
@@ -115,39 +148,101 @@ pub fn set_backlight_bluetooth(level: u8) -> Result<(), String> {
     Ok(())
 }
 
-fn find_bt_hidraw() -> Result<String, String> {
-    let hidraw_dir = Path::new("/sys/class/hidraw");
-    if let Ok(entries) = fs::read_dir(hidraw_dir) {
-        for entry in entries.flatten() {
-            let uevent_path = entry.path().join("device/uevent");
-            if let Ok(contents) = fs::read_to_string(&uevent_path) {
-                if (contents.contains("Zenbook Duo Keyboard") || contents.contains("ASUS_DUO"))
-                    && contents.contains("0005:")
-                {
-                    let name = entry.file_name();
-                    return Ok(format!("/dev/{}", name.to_string_lossy()));
-                }
-            }
-        }
-    }
-    Err("Bluetooth hidraw device not found".into())
+fn build_backlight_report(level: u8) -> [u8; FEATURE_REPORT_LEN] {
+    let mut data = [0u8; FEATURE_REPORT_LEN];
+    data[0] = 0x5A;
+    data[1] = 0xBA;
+    data[2] = 0xC5;
+    data[3] = 0xC4;
+    data[4] = level.min(3);
+    data
 }
 
-/// Set backlight, trying USB first then Bluetooth.
-pub fn set_backlight(level: u8) -> Result<(), String> {
-    // Try USB first
-    let usb_err = match set_backlight_usb(level) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
+/// The BT keyboard exposes both hid-generic and hid-multitouch hidraw nodes; prefer generic.
+fn list_bluetooth_hidraw_paths() -> Vec<String> {
+    let mut paths: Vec<(u32, String)> = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/hidraw") else {
+        return Vec::new();
     };
 
-    // Try Bluetooth
-    let bt_err = match set_backlight_bluetooth(level) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
+    for entry in entries.flatten() {
+        let uevent_path = entry.path().join("device/uevent");
+        let Ok(contents) = fs::read_to_string(&uevent_path) else {
+            continue;
+        };
+        if !is_zenbook_bluetooth_uevent(&contents) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        paths.push((hidraw_priority(&contents), format!("/dev/{name}")));
+    }
 
-    Err(format!(
-        "Failed to set keyboard backlight natively (usb: {usb_err}; bt: {bt_err})"
-    ))
+    paths.sort_by_key(|(priority, _)| *priority);
+    paths.into_iter().map(|(_, path)| path).collect()
+}
+
+fn is_zenbook_bluetooth_uevent(contents: &str) -> bool {
+    (contents.contains("Zenbook Duo Keyboard") || contents.contains("ASUS_DUO"))
+        && contents.contains("HID_ID=0005:")
+}
+
+fn hidraw_priority(contents: &str) -> u32 {
+    if contents.contains("DRIVER=hid-multitouch") || contents.contains("g0004") {
+        100
+    } else if contents.contains("DRIVER=hid-generic") || contents.contains("g0001") {
+        0
+    } else {
+        50
+    }
+}
+
+fn reset_bluetooth_keyboard_hid() -> Result<(), String> {
+    let device_id = find_bluetooth_hid_device_id("hid-generic")
+        .ok_or_else(|| "bluetooth keyboard hid device not found".to_string())?;
+
+    fs::write(
+        "/sys/bus/hid/drivers/hid-generic/unbind",
+        &device_id,
+    )
+    .map_err(|e| format!("Failed to unbind {device_id}: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    fs::write("/sys/bus/hid/drivers/hid-generic/bind", &device_id)
+        .map_err(|e| format!("Failed to rebind {device_id}: {e}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(())
+}
+
+fn find_bluetooth_hid_device_id(driver: &str) -> Option<String> {
+    let entries = fs::read_dir("/sys/bus/hid/devices").ok()?;
+    for entry in entries.flatten() {
+        let device_path = entry.path();
+        let uevent = fs::read_to_string(device_path.join("uevent")).ok()?;
+        if !is_zenbook_bluetooth_uevent(&uevent) {
+            continue;
+        }
+        let linked_driver = fs::read_link(device_path.join("driver"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))?;
+        if linked_driver != driver {
+            continue;
+        }
+        return Some(entry.file_name().to_string_lossy().into_owned());
+    }
+    None
+}
+
+fn both_failed(usb_err: String, bt_err: String) -> String {
+    format!("Failed to set keyboard backlight natively (usb: {usb_err}; bt: {bt_err})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hidraw_priority;
+
+    #[test]
+    fn prefers_generic_hidraw_over_multitouch() {
+        let generic = "DRIVER=hid-generic\nMODALIAS=hid:b0005g0001v00000B05p00001CD8\n";
+        let multitouch = "DRIVER=hid-multitouch\nMODALIAS=hid:b0005g0004v00000B05p00001CD8\n";
+        assert!(hidraw_priority(generic) < hidraw_priority(multitouch));
+    }
 }
