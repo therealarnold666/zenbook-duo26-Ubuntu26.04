@@ -184,6 +184,15 @@ if [ "$KEEP_CONFIG" = false ]; then
 fi
 
 # ============================================================================
+# PROJECT-MANAGED KERNEL PARAMETERS
+# ============================================================================
+
+XE_BACKLIGHT_HELPER="$(cd "$(dirname "$0")" && pwd)/tools/configure-xe-backlight.sh"
+if [ -x "${XE_BACKLIGHT_HELPER}" ]; then
+    "${XE_BACKLIGHT_HELPER}" remove || echo "WARN: failed to remove xe backlight GRUB drop-in"
+fi
+
+# ============================================================================
 # FINISH
 # ============================================================================
 

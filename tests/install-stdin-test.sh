@@ -83,10 +83,14 @@ if ! grep -q 'import-environment DISPLAY WAYLAND_DISPLAY NIRI_SOCKET XDG_CURRENT
 fi
 
 for setup_script in setup-gnome.sh setup-kde.sh setup-niri.sh; do
-  if ! grep -q 'command -v pacman' "${ROOT_DIR}/${setup_script}"; then
-    echo "FAIL: ${setup_script} should support pacman-based systems" >&2
-    exit 1
-  fi
+    if ! grep -q 'command -v pacman' "${ROOT_DIR}/${setup_script}"; then
+        echo "FAIL: ${setup_script} should support pacman-based systems" >&2
+        exit 1
+    fi
+    if ! grep -q 'configure-xe-backlight.sh" install' "${ROOT_DIR}/${setup_script}"; then
+        echo "FAIL: ${setup_script} should configure UX8407AA DPCD backlight support" >&2
+        exit 1
+    fi
 done
 
 if ! grep -q 'PKG_MGR="pacman"' "${ROOT_DIR}/install-ui.sh"; then
@@ -100,8 +104,14 @@ if ! grep -q 'install_ui_direct' "${ROOT_DIR}/install-ui.sh"; then
 fi
 
 if ! grep -q 'sudo pacman -Rns --noconfirm zenbook-duo-control' "${ROOT_DIR}/uninstall.sh"; then
-  echo "FAIL: uninstall.sh should try pacman removal when available" >&2
-  exit 1
+    echo "FAIL: uninstall.sh should try pacman removal when available" >&2
+    exit 1
+fi
+
+if ! grep -q 'XE_BACKLIGHT_HELPER=.*configure-xe-backlight.sh' "${ROOT_DIR}/uninstall.sh" ||
+    ! grep -q '"${XE_BACKLIGHT_HELPER}" remove' "${ROOT_DIR}/uninstall.sh"; then
+    echo "FAIL: uninstall should remove the project-managed xe backlight parameter" >&2
+    exit 1
 fi
 
 echo "PASS"

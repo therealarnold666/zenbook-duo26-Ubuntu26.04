@@ -4,6 +4,21 @@ Date: 2026-07-24
 
 This note records the current backlight layout on the local machine and compares it with the paths hardcoded in this project.
 
+## Current resolution
+
+The current runtime no longer relies on only `card1-eDP-2-backlight`. It
+checks `card0-eDP-2-backlight`, `card1-eDP-2-backlight`, and
+`asus_screenpad` in that order. The setup scripts grant access to both DRM
+backlight names.
+
+The UX8407AA installer also manages the xe startup parameter
+`xe.enable_dpcd_backlight=3` through
+`tools/configure-xe-backlight.sh`. This forces the Intel DPCD backlight
+interface selected during the earlier A/B investigation. It is independent
+from the PSR and Panel Replay stability parameters.
+
+The remainder of this document preserves the original compatibility snapshot.
+
 ## Local machine
 
 Machine:

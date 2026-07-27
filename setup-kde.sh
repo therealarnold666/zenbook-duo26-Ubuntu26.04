@@ -248,6 +248,9 @@ PY
     fi
 fi
 
+echo "Configuring UX8407AA xe DPCD backlight support..."
+"$(cd "$(dirname "$0")" && pwd)/tools/configure-xe-backlight.sh" install
+
 echo "Installing Rust runtime..."
 "$(cd "$(dirname "$0")" && pwd)/install-rust-runtime.sh"
 

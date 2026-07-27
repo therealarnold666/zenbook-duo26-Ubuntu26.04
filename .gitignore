@@ -20,6 +20,7 @@ lerna-debug.log*
 /captures/
 /local-reports/
 /artifacts/
+/secureboot-openssl.cnf
 
 node_modules
 dist

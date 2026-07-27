@@ -17,7 +17,8 @@ The current known-good test system is Ubuntu 26.04 with GNOME on Wayland:
 - Machine: ASUS Zenbook Duo UX8407AA
 - Kernel: `7.2.0-rc4-zenbook-ab72tcsshold1`
 - Kernel base: Linux 7.2-rc4
-- Validation parameters retained during testing:
+- Managed brightness parameter: `xe.enable_dpcd_backlight=3`
+- Additional validation parameters retained on the test machine:
   `xe.enable_psr=0 xe.enable_panel_replay=0`
 - Display scale: `1.67x`
 - Runtime services: system daemon, lifecycle helper, and user session agent
@@ -39,7 +40,7 @@ delta is provided in
 | Bluetooth recovery on keyboard detach | Yes | Does not change Wi-Fi state |
 | USB and Bluetooth keyboard detection | Yes | UX8407AA USB ID `0b05:1cd7` |
 | Keyboard backlight boot/attach restore | Yes | Includes attach/detach state synchronization |
-| Display brightness synchronization | Yes | Uses session display interfaces and sysfs helpers |
+| Display brightness synchronization | Yes | Dynamic eDP-2 sysfs detection plus Intel DPCD backlight mode |
 | Orientation controls | Yes | Corrects the main panel's physical 180-degree mounting baseline |
 | Dual-screen left/right arrangement | Yes | Uses the UX8407AA physical panel order |
 | Automatic sensor rotation | Partial | Session agent handles `monitor-sensor`; no UI on/off switch yet |
@@ -71,14 +72,16 @@ The installer:
 
 - Detects GNOME, KDE Plasma, or Niri.
 - Installs compositor and sensor dependencies.
+- Configures `xe.enable_dpcd_backlight=3` on UX8407AA through a managed GRUB drop-in.
 - Installs Rust through rustup when Cargo is unavailable.
 - Builds and installs the four Rust runtime binaries.
 - Enables the system daemon, lifecycle service, and session agent.
 - Builds and installs the Tauri control panel unless `--skip-ui` is used.
 - Adds required udev, input-group, backlight, and autostart integration.
 
-Log out and back in after the first install so group and session environment
-changes take effect.
+Reboot after the first install so the xe backlight parameter takes effect,
+then log out and back in if group or session environment changes still need
+to be refreshed.
 
 Useful alternatives:
 
@@ -102,7 +105,36 @@ systemctl --user is-active zenbook-duo-session-agent.service
 All three services should report `active`. Attach and detach the keyboard and
 confirm that the lower display follows it and Bluetooth remains available.
 
-## Two Separate Kernel Issues
+Check the managed xe backlight parameter with:
+
+```bash
+./tools/configure-xe-backlight.sh status
+```
+
+`grub-configured=yes` means the next boot will include it;
+`running-kernel-active=yes` means the current boot already includes it.
+
+## Kernel and Driver Requirements
+
+### DPCD screen brightness
+
+The UX8407AA panels expose brightness control through the eDP DisplayPort AUX
+channel. This project installs `xe.enable_dpcd_backlight=3`, which tells xe to
+force the Intel DPCD backlight interface. Without it, the expected DRM
+backlight node may be absent or brightness changes may not reach the panel.
+
+The installer writes only
+`/etc/default/grub.d/90-zenbook-duo-xe-backlight.cfg`; it does not rewrite
+`/etc/default/grub` or own the PSR/Panel Replay options. Manage it manually
+when needed:
+
+```bash
+./tools/configure-xe-backlight.sh install
+./tools/configure-xe-backlight.sh status
+./tools/configure-xe-backlight.sh remove
+```
+
+A reboot is required after `install` or `remove`.
 
 ### Spurious airplane mode
 
