@@ -44,7 +44,7 @@ chmod +x "${fake_bin}/git"
 checkout_output="$(bash --noprofile --norc -c '
   set -euo pipefail
   export PATH="'"${fake_bin}"':/usr/bin:/bin"
-  source <(sed -n "1,126p" "'"${ROOT_DIR}"'/install.sh")
+  source <(awk '"'"'/^if \[ "\$\{1:-\}" = "-h"/ { exit } { print }'"'"' "'"${ROOT_DIR}"'/install.sh")
   SCRIPT_DIR="'"${temp_root}"'/missing-checkout"
   ensure_repo_checkout
 ' 2>/dev/null)" || {
@@ -62,8 +62,18 @@ if [[ ! -f "${checkout_output}/setup-niri.sh" ]]; then
   exit 1
 fi
 
-if ! grep -q 'WantedBy=default.target' "${ROOT_DIR}/install-rust-runtime.sh"; then
-  echo "FAIL: user service should be enabled from default.target" >&2
+if ! grep -q 'WantedBy=graphical-session.target' "${ROOT_DIR}/install-rust-runtime.sh"; then
+  echo "FAIL: user service should be enabled from graphical-session.target" >&2
+  exit 1
+fi
+
+if ! grep -q 'therealarnold666/zenbook-duo26-Ubuntu26.04.git' "${ROOT_DIR}/install.sh"; then
+  echo "FAIL: unified installer should download the current repository" >&2
+  exit 1
+fi
+
+if ! grep -q 'Installing via rustup' "${ROOT_DIR}/install-rust-runtime.sh"; then
+  echo "FAIL: runtime installer should bootstrap Rust when Cargo is missing" >&2
   exit 1
 fi
 

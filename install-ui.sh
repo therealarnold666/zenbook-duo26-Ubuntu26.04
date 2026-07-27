@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL_DEFAULT="https://github.com/zakstam/zenbook-duo-linux.git"
+REPO_URL_DEFAULT="https://github.com/therealarnold666/zenbook-duo26-Ubuntu26.04.git"
 BRANCH_DEFAULT=""
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-${0}}"
@@ -24,7 +24,7 @@ Usage:
 Examples:
   ./install-ui.sh
   ./install-ui.sh --dir "$HOME/src/zenbook-duo-linux"
-  ./install-ui.sh --repo https://github.com/zakstam/zenbook-duo-linux.git --branch main
+  ./install-ui.sh --repo https://github.com/therealarnold666/zenbook-duo26-Ubuntu26.04.git --branch main
 
 Notes:
   - The Control Panel can be launched from your app menu after install.

@@ -87,7 +87,13 @@ need_cmd() {
 }
 
 if ! run_as_target_user cargo --version >/dev/null 2>&1; then
-  echo "ERROR: Missing required command: cargo for target user '${TARGET_USER}'" >&2
+  need_cmd curl
+  echo "Rust toolchain not found for '${TARGET_USER}'. Installing via rustup..."
+  run_as_target_user sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+fi
+
+if ! run_as_target_user cargo --version >/dev/null 2>&1; then
+  echo "ERROR: Cargo is still unavailable for target user '${TARGET_USER}' after rustup installation." >&2
   exit 1
 fi
 

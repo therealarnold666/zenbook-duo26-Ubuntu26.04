@@ -7,8 +7,8 @@ if [ -n "${SCRIPT_PATH}" ] && [ "${SCRIPT_PATH}" != "bash" ] && [ "${SCRIPT_PATH
 else
   SCRIPT_DIR="$(pwd)"
 fi
-REPO_URL="https://github.com/zakstam/zenbook-duo-linux.git"
-ARCHIVE_URL="https://github.com/zakstam/zenbook-duo-linux/archive/refs/heads/main.tar.gz"
+REPO_URL="https://github.com/therealarnold666/zenbook-duo26-Ubuntu26.04.git"
+ARCHIVE_URL="https://github.com/therealarnold666/zenbook-duo26-Ubuntu26.04/archive/refs/heads/main.tar.gz"
 
 usage() {
   cat <<'EOF'
