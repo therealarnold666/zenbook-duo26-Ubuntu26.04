@@ -136,6 +136,7 @@ fn initialize_state() -> RuntimeState {
     state.status.service_active = false;
     state.settings = commands::settings::load_settings_local();
     state.session_agent = Default::default();
+    state.validate_secondary_panel_ownership_for_current_boot();
     state.touch();
     persist_state(&state);
     let _ = logger::append_line("rust-daemon: initialized runtime state");
@@ -233,6 +234,7 @@ async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>, attached: boo
         );
     }
 
+    let secondary_panel_was_enabled = hardware::sysfs::secondary_panel_enabled();
     let command = SessionCommand::SetDockMode { attached, scale };
     if let Err(err) = forward_session_command(&state, command).await {
         log::warn!("startup dock replay failed: {err}");
@@ -244,9 +246,14 @@ async fn run_startup_replay_once(state: Arc<RwLock<RuntimeState>>, attached: boo
         .await;
         let _ = logger::append_line(format!("rust-daemon: startup dock replay failed: {err}"));
     } else {
+        let mut guard = state.write().await;
+        guard.record_successful_dock_mode(attached, secondary_panel_was_enabled);
+        guard.touch();
+        persist_state(&guard);
+        drop(guard);
         let _ = logger::append_line(format!(
-            "rust-daemon: startup dock replay applied (attached={}, scale={})",
-            attached, scale
+            "rust-daemon: startup dock replay applied (attached={}, scale={}, secondary_was_enabled={})",
+            attached, scale, secondary_panel_was_enabled
         ));
     }
 
@@ -655,14 +662,16 @@ async fn replay_current_dock_mode(
         let Some(current_target) = current_target else {
             return Ok(());
         };
+        let max_attempts = dock_replay_attempt_limit(current_target.attached);
+        let secondary_panel_was_enabled = hardware::sysfs::secondary_panel_enabled();
 
         let mut last_error: Option<String> = None;
         let mut succeeded = false;
-        for attempt in 1..=DOCK_REPLAY_MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
             let _ = logger::append_line(format!(
                 "rust-daemon: dock replay attempt {}/{} session_generation={} dock_target_generation={} attached={} scale={} replay_attempt={}",
                 attempt,
-                DOCK_REPLAY_MAX_ATTEMPTS,
+                max_attempts,
                 session_generation,
                 current_target.generation,
                 current_target.attached,
@@ -689,7 +698,7 @@ async fn replay_current_dock_mode(
                         session_generation, current_target.generation, attempt, err
                     ));
                     last_error = Some(err);
-                    if attempt < DOCK_REPLAY_MAX_ATTEMPTS {
+                    if attempt < max_attempts {
                         tokio::time::sleep(DOCK_REPLAY_RETRY_DELAY).await;
                     }
                 }
@@ -697,6 +706,15 @@ async fn replay_current_dock_mode(
         }
 
         if succeeded {
+            {
+                let mut guard = state.write().await;
+                guard.record_successful_dock_mode(
+                    current_target.attached,
+                    secondary_panel_was_enabled,
+                );
+                guard.touch();
+                persist_state(&guard);
+            }
             {
                 let mut guard = dock_replay_target_cell().lock().await;
                 if matches!(*guard, Some(target) if target.generation == current_target.generation)
@@ -735,6 +753,16 @@ async fn replay_current_dock_mode(
     }
 }
 
+fn dock_replay_attempt_limit(attached: bool) -> usize {
+    if attached {
+        DOCK_REPLAY_MAX_ATTEMPTS
+    } else {
+        // A bad xe eDP-2 pipe can block a detached modeset for several seconds.
+        // Never multiply that stall by retrying the same failing request.
+        1
+    }
+}
+
 pub(crate) async fn forward_session_command(
     state: &Arc<RwLock<RuntimeState>>,
     command: SessionCommand,
@@ -769,10 +797,12 @@ async fn apply_orientation(
     state: &Arc<RwLock<RuntimeState>>,
     orientation: Orientation,
 ) -> DaemonResponse {
+    let scale = state.read().await.settings.default_scale;
     match forward_session_command(
         state,
         SessionCommand::SetOrientation {
             orientation: orientation.clone(),
+            scale,
         },
     )
     .await
@@ -1195,8 +1225,9 @@ mod tests {
             let envelope: Envelope<SessionCommand> =
                 serde_json::from_str(&line).expect("decode session request");
             match envelope.payload {
-                SessionCommand::SetOrientation { orientation } => {
+                SessionCommand::SetOrientation { orientation, scale } => {
                     assert_eq!(orientation, Orientation::Left);
+                    assert_eq!(scale, 1.67);
                 }
                 other => panic!("unexpected session command: {other:?}"),
             }
@@ -1838,6 +1869,12 @@ mod tests {
 
         server.await.expect("join session server");
         let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn detached_dock_replay_is_not_retried() {
+        assert_eq!(dock_replay_attempt_limit(false), 1);
+        assert_eq!(dock_replay_attempt_limit(true), DOCK_REPLAY_MAX_ATTEMPTS);
     }
 
     fn unique_test_socket_path(label: &str) -> PathBuf {

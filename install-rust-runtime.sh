@@ -63,6 +63,22 @@ import_user_environment() {
   fi
 }
 
+run_as_target_user() {
+  if [ "${EUID}" != "0" ] && [ "${TARGET_USER}" = "${USER:-}" ]; then
+    "$@"
+    return
+  fi
+
+  sudo -u "${TARGET_USER}" \
+    HOME="${TARGET_HOME}" \
+    USER="${TARGET_USER}" \
+    LOGNAME="${TARGET_USER}" \
+    CARGO_HOME="${TARGET_HOME}/.cargo" \
+    RUSTUP_HOME="${TARGET_HOME}/.rustup" \
+    PATH="${TARGET_HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+    "$@"
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "ERROR: Missing required command: $1" >&2
@@ -70,7 +86,10 @@ need_cmd() {
   }
 }
 
-need_cmd cargo
+if ! run_as_target_user cargo --version >/dev/null 2>&1; then
+  echo "ERROR: Missing required command: cargo for target user '${TARGET_USER}'" >&2
+  exit 1
+fi
 
 if [ ! -f "${TAURI_DIR}/Cargo.toml" ]; then
   echo "ERROR: Could not find Tauri crate at ${TAURI_DIR}" >&2
@@ -78,7 +97,7 @@ if [ ! -f "${TAURI_DIR}/Cargo.toml" ]; then
 fi
 
 echo "Building Rust runtime binaries..."
-cargo build --release \
+run_as_target_user cargo build --release \
   --manifest-path "${TAURI_DIR}/Cargo.toml" \
   --bin zenbook-duo-daemon \
   --bin zenbook-duo-session-agent \
@@ -129,8 +148,8 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=${RUNTIME_INSTALL_DIR}/zenbook-duo-lifecycle boot
-ExecStop=${RUNTIME_INSTALL_DIR}/zenbook-duo-lifecycle shutdown
+ExecStart=-${RUNTIME_INSTALL_DIR}/zenbook-duo-lifecycle boot
+ExecStop=-${RUNTIME_INSTALL_DIR}/zenbook-duo-lifecycle shutdown
 RemainAfterExit=yes
 TimeoutStartSec=10
 TimeoutStopSec=10

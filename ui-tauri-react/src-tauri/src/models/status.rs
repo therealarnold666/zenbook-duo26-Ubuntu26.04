@@ -74,6 +74,8 @@ pub struct DisplayInfo {
     pub y: i32,
     pub transform: u32,
     pub primary: bool,
+    #[serde(default)]
+    pub enabled: bool,
     pub current_mode: DisplayMode,
     pub available_modes: Vec<DisplayMode>,
     pub refresh_policy: RefreshPolicy,

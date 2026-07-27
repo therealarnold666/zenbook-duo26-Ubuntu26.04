@@ -46,7 +46,7 @@ const defaultStatus: DuoStatus = {
 
 const defaultSettings: DuoSettings = {
   defaultBacklight: 3,
-  defaultScale: 1.66,
+  defaultScale: 1.67,
   autoDualScreen: true,
   syncBrightness: true,
   theme: "system",

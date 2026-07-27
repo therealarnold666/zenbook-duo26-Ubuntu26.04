@@ -28,6 +28,7 @@ export interface DisplayInfo {
   y: number;
   transform: number;
   primary: boolean;
+  enabled: boolean;
   currentMode: DisplayMode;
   availableModes: DisplayMode[];
   refreshPolicy: RefreshPolicy;

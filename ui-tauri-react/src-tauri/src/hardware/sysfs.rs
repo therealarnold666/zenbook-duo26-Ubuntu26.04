@@ -1,11 +1,38 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::models::{ConnectionType, DuoStatus, Orientation};
 use crate::runtime::{paths, state::RuntimeState};
 
 const INTEL_BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/intel_backlight/brightness";
 const INTEL_BACKLIGHT_MAX: &str = "/sys/class/backlight/intel_backlight/max_brightness";
+const SECONDARY_BACKLIGHT_CANDIDATES: [&str; 3] = [
+    "/sys/class/backlight/card0-eDP-2-backlight",
+    "/sys/class/backlight/card1-eDP-2-backlight",
+    "/sys/class/backlight/asus_screenpad",
+];
+
+/// xe can leave the secondary connector present but disable its pipe after an
+/// attached-keyboard boot failure. Do not modeset that pipe again until the
+/// driver reports it enabled.
+pub fn secondary_panel_enabled() -> bool {
+    fs::read_dir("/sys/class/drm")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.starts_with("card") && name.ends_with("-eDP-2"))
+                .then_some(entry.path().join("enabled"))
+        })
+        .any(|path| {
+            fs::read_to_string(path)
+                .map(|contents| contents.trim() == "enabled")
+                .unwrap_or(false)
+        })
+}
 
 fn load_runtime_state() -> Option<RuntimeState> {
     let path = paths::state_file_path();
@@ -31,6 +58,18 @@ pub fn read_max_brightness() -> u32 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1)
+}
+
+pub fn secondary_backlight_dir() -> Option<PathBuf> {
+    SECONDARY_BACKLIGHT_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .map(Path::to_path_buf)
+}
+
+pub fn secondary_backlight_brightness_path() -> Option<PathBuf> {
+    secondary_backlight_dir().map(|path| path.join("brightness"))
 }
 
 pub fn detect_connection_type() -> ConnectionType {

@@ -40,8 +40,8 @@
 
 最近两份对比报告路径：
 
-- `/home/arnold/Projects/zenbook-duo-linux-main/debug/greeter-forensics/report-20260408T182132Z-d5febc57-8037-41c0-a629-c7e650b7427c-unspecified.md`
-- `/home/arnold/Projects/zenbook-duo-linux-main/debug/greeter-forensics/report-20260408T181903Z-5aa3b022-939c-4939-a9c5-7607e2ddedac-unspecified.md`
+- `debug/greeter-forensics/report-20260408T182132Z-unspecified.md`
+- `debug/greeter-forensics/report-20260408T181903Z-unspecified.md`
 
 对应原始 run 目录：
 

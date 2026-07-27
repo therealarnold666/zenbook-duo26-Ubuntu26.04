@@ -143,8 +143,11 @@ async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
                     Err(message) => SessionResponse::Error { message },
                 }
             }
-            SessionCommand::SetOrientation { orientation } => {
-                match crate::hardware::display_config::set_orientation(&orientation) {
+            SessionCommand::SetOrientation { orientation, scale } => {
+                match crate::hardware::display_config::set_orientation_with_scale(
+                    &orientation,
+                    scale,
+                ) {
                     Ok(()) => SessionResponse::Ack,
                     Err(message) => SessionResponse::Error { message },
                 }
@@ -802,18 +805,17 @@ fn keyboard_attached_from_runtime() -> bool {
 }
 
 fn sync_secondary_brightness(level: u32) -> Result<(), String> {
-    const SECONDARY_PATH: &str = "/sys/class/backlight/card1-eDP-2-backlight/brightness";
-
-    if !Path::new(SECONDARY_PATH).exists() {
+    let Some(secondary_path) = crate::hardware::sysfs::secondary_backlight_brightness_path() else {
         return Ok(());
-    }
+    };
 
-    if fs::write(SECONDARY_PATH, level.to_string()).is_ok() {
+    if fs::write(&secondary_path, level.to_string()).is_ok() {
         return Ok(());
     }
 
     let mut child = Command::new("sudo")
-        .args(["/usr/bin/tee", SECONDARY_PATH])
+        .arg("/usr/bin/tee")
+        .arg(&secondary_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -835,7 +837,8 @@ fn sync_secondary_brightness(level: u32) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Brightness sync failed: {}",
+            "Brightness sync failed for {}: {}",
+            secondary_path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }

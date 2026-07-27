@@ -146,6 +146,7 @@ pub enum SessionCommand {
     },
     SetOrientation {
         orientation: Orientation,
+        scale: f64,
     },
     ShowNotification {
         title: String,

@@ -79,6 +79,13 @@ To remove the optional UI app:
 
 ## Advanced (Technical)
 
+### Development notes
+
+- [UX8407AA kernel and runtime fixes (2026-07-27)](UX8407AA_KERNEL_AND_RUNTIME_FIXES_2026-07-27.md)
+- [eDP-2 keyboard A/B report](XE_EDP2_KEYBOARD_AB_REPORT.md)
+- [Main-panel rotation investigation](MAIN_PANEL_ROTATION_INVESTIGATION.md)
+- [Keyboard backlight compatibility notes](BACKLIGHT_COMPATIBILITY_NOTES_2026-07-24.md)
+
 ### Screenshots
 
 ![Zenbook Duo Control USB](sc.png)
@@ -90,10 +97,8 @@ To remove the optional UI app:
 |---------|:---:|:---------:|
 | Toggle bottom screen on when keyboard removed | ✅ | ✅ |
 | Toggle bottom screen off when keyboard placed | ✅ | ✅ |
-| Toggle bluetooth on when keyboard removed | ✅ | ✅ |
-| Toggle bluetooth off when keyboard placed (if it was off before) | ✅ | ✅ |
+| Ensure Bluetooth is available when keyboard removed | ✅ | ✅ |
 | Screen brightness sync | ✅ | ✅ |
-| Reset airplane mode on keyboard attach/detach | ✅ | N/A |
 | Keyboard backlight set on boot/attach | ✅ | ✅ |
 | Keyboard backlight sync across attach/detach | ✅ | ✅ |
 | Keyboard backlight cycle (F4) | ✅ | ✅ |

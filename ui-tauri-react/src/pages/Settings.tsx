@@ -124,6 +124,7 @@ export default function Settings() {
                 <SelectItem value="1.25">1.25x (125%)</SelectItem>
                 <SelectItem value="1.5">1.5x (150%)</SelectItem>
                 <SelectItem value="1.66">1.66x (166%)</SelectItem>
+                <SelectItem value="1.67">1.67x (167%)</SelectItem>
                 <SelectItem value="2">2.0x (200%)</SelectItem>
               </SelectContent>
             </Select>

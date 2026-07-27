@@ -1,11 +1,25 @@
-# Logs
+# Logs and local diagnostics
 logs
 *.log
+*.journal
+*.dmesg
+*.trace
+*.dump
+core
+core.*
+perf.data*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+
+# Local inspection output
+/.codex-icon-check/
+/icon-check/
+/captures/
+/local-reports/
+/artifacts/
 
 node_modules
 dist
@@ -14,6 +28,31 @@ dist-ssr
 
 # Rust / Tauri
 target/
+
+# Native and kernel build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+/linux-*/
+/kernel-*/
+/kernel-build*/
+
+# Distribution packages and archives
+*.deb
+*.ddeb
+*.rpm
+*.AppImage
+*.buildinfo
+*.changes
+*.tar
+*.tar.gz
+*.tar.xz
+*.tgz
+*.zip
 
 # Environment and secrets
 .env
@@ -36,6 +75,9 @@ id_ed25519.pub
 # Test coverage
 coverage/
 .nyc_output/
+.pytest_cache/
+__pycache__/
+*.py[cod]
 
 # TypeScript
 *.tsbuildinfo
@@ -43,6 +85,8 @@ coverage/
 # OS
 Thumbs.db
 *.orig
+*.rej
+*~
 
 # Editor directories and files
 .vscode/*

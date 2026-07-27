@@ -221,6 +221,7 @@ export default function DisplayLayout() {
                     <SelectItem value="1.5">1.5x</SelectItem>
                     <SelectItem value="1.75">1.75x</SelectItem>
                     <SelectItem value="1.66">1.66x</SelectItem>
+                    <SelectItem value="1.67">1.67x</SelectItem>
                     <SelectItem value="2">2.0x</SelectItem>
                   </SelectContent>
                 </Select>

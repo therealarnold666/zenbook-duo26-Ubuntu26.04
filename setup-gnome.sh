@@ -9,7 +9,7 @@
 
 # Default configuration values
 DEFAULT_BACKLIGHT=0
-DEFAULT_SCALE=1.66
+DEFAULT_SCALE=1.67
 USB_MEDIA_REMAP_ENABLED=true
 USB_MEDIA_REMAP_DEFAULT=true
 
@@ -99,7 +99,7 @@ function duo_prompt() {
 # Prompt user for configuration preferences (Enter accepts the default)
 duo_prompt "What would you like to use for the default keyboard backlight brightness [0-3] (default: ${DEFAULT_BACKLIGHT})? " _input
 DEFAULT_BACKLIGHT="${_input:-${DEFAULT_BACKLIGHT}}"
-duo_prompt "What would you like to use for monitor scale (1 = 100%, 1.5 = 150%, 1.66 = 166%, 2=200%) (default: ${DEFAULT_SCALE})? " _input
+duo_prompt "What would you like to use for monitor scale (1 = 100%, 1.5 = 150%, 1.67 = 167%, 2=200%) (default: ${DEFAULT_SCALE})? " _input
 DEFAULT_SCALE="${_input:-${DEFAULT_SCALE}}"
 if [ "${USB_MEDIA_REMAP_DEFAULT}" = "true" ]; then
     duo_prompt "Enable USB Media Remap by default? [Y/n] " ENABLE_USB_MEDIA_REMAP_ANSWER
@@ -158,6 +158,7 @@ function addSudoers() {
 
 # Configure passwordless sudo for sysfs brightness writes used by the Rust session agent.
 if [ -n "${TARGET_USER}" ]; then
+    addSudoers "${TARGET_USER} ALL=NOPASSWD:/usr/bin/tee /sys/class/backlight/card0-eDP-2-backlight/brightness"
     addSudoers "${TARGET_USER} ALL=NOPASSWD:/usr/bin/tee /sys/class/backlight/card1-eDP-2-backlight/brightness"
     addSudoers "${TARGET_USER} ALL=NOPASSWD:/usr/bin/tee /sys/class/backlight/intel_backlight/brightness"
 fi

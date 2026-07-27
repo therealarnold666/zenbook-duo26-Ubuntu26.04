@@ -1,0 +1,31 @@
+From 2997606dd17729404cef9821ce66dd037b6019eb Mon Sep 17 00:00:00 2001
+Subject: [PATCH] platform/x86: asus-nb-wmi: add DMI quirk for ASUS Zenbook Duo UX8407AA
+
+Use the existing Zenbook Duo keyboard quirk for the UX8407AA model too.
+
+Upstream: 2997606dd17729404cef9821ce66dd037b6019eb
+---
+ drivers/platform/x86/asus-nb-wmi.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/platform/x86/asus-nb-wmi.c b/drivers/platform/x86/asus-nb-wmi.c
+--- a/drivers/platform/x86/asus-nb-wmi.c
++++ b/drivers/platform/x86/asus-nb-wmi.c
+@@ -544,6 +544,15 @@ static const struct dmi_system_id asus_quirks[] = {
+ 		},
+ 		.driver_data = &quirk_asus_zenbook_duo_kbd,
+ 	},
++	{
++		.callback = dmi_matched,
++		.ident = "ASUS Zenbook Duo UX8407AA",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUS"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Zenbook Duo UX8407AA"),
++		},
++		.driver_data = &quirk_asus_zenbook_duo_kbd,
++	},
+ 	{
+ 		.callback = dmi_matched,
+ 		.ident = "ASUS ROG Z13",
+-- 
+2.53.0

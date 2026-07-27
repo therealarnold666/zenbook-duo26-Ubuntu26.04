@@ -368,6 +368,7 @@ fn parse_gdctl_output(output: &str) -> Result<DisplayLayout, String> {
             y: logical.y,
             transform: logical.transform,
             primary: logical.primary,
+            enabled: had_logical,
             current_mode,
             available_modes,
             refresh_policy: RefreshPolicy::Fixed,
@@ -595,6 +596,7 @@ fn get_kde_display_layout() -> Result<DisplayLayout, String> {
                 _ => 0,
             },
             primary: output.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+            enabled: true,
             current_mode,
             available_modes,
             refresh_policy: RefreshPolicy::Fixed,
@@ -723,6 +725,7 @@ fn get_niri_display_layout() -> Result<DisplayLayout, String> {
             y: logical.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             transform: parse_niri_transform(&output),
             primary: connector == "eDP-1",
+            enabled: true,
             current_mode,
             available_modes,
             refresh_policy,
@@ -933,8 +936,8 @@ fn gnome_logical_monitor_count() -> Result<usize, String> {
         .count())
 }
 
-fn set_gnome_orientation(orientation: &Orientation) -> Result<(), String> {
-    let scale = gnome_scale()?;
+fn set_gnome_orientation(orientation: &Orientation, scale: Option<f64>) -> Result<(), String> {
+    let scale = scale.filter(|scale| *scale > 0.0).unwrap_or(gnome_scale()?);
     let logical_count = gnome_logical_monitor_count().unwrap_or(1);
     let args = build_gnome_orientation_args(orientation, scale, logical_count);
     run_command("gdctl", &args)
@@ -943,11 +946,25 @@ fn set_gnome_orientation(orientation: &Orientation) -> Result<(), String> {
 fn gnome_orientation_transforms(orientation: &Orientation) -> (&'static str, &'static str) {
     // Duo baseline for GNOME:
     // normal => eDP-1 flipped(180), eDP-2 normal
+    // GNOME's numeric viewport transforms are opposite to the UI's left/right
+    // labels, just as KDE's rotation tokens are.
     match orientation {
         Orientation::Normal => ("180", "normal"),
-        Orientation::Left => ("270", "90"),
-        Orientation::Right => ("90", "270"),
+        Orientation::Left => ("90", "270"),
+        Orientation::Right => ("270", "90"),
         Orientation::Inverted => ("normal", "180"),
+    }
+}
+
+/// Translate the main panel's persisted GNOME transform into the orientation
+/// exposed by the app. eDP-1 is mounted upside down, so its normal baseline is
+/// `180` rather than `normal`.
+pub fn zenbook_duo_primary_orientation(transform: u32) -> Orientation {
+    match transform % 360 {
+        180 => Orientation::Normal,
+        90 => Orientation::Left,
+        270 => Orientation::Right,
+        _ => Orientation::Inverted,
     }
 }
 
@@ -979,8 +996,10 @@ fn build_gnome_orientation_args(
         args.push("eDP-2".to_string());
 
         match orientation {
-            Orientation::Left => args.extend(["--left-of", "eDP-1"].map(str::to_string)),
-            Orientation::Right => args.extend(["--right-of", "eDP-1"].map(str::to_string)),
+            // The primary panel's mounted orientation reverses horizontal layout
+            // placement in the compositor coordinate space.
+            Orientation::Left => args.extend(["--right-of", "eDP-1"].map(str::to_string)),
+            Orientation::Right => args.extend(["--left-of", "eDP-1"].map(str::to_string)),
             Orientation::Inverted => args.extend(["--above", "eDP-1"].map(str::to_string)),
             Orientation::Normal => args.extend(["--below", "eDP-1"].map(str::to_string)),
         }
@@ -1199,8 +1218,15 @@ fn set_niri_orientation(orientation: &Orientation) -> Result<(), String> {
 
 /// Set screen orientation using compositor-native commands.
 pub fn set_orientation(orientation: &Orientation) -> Result<(), String> {
+    set_orientation_with_scale(orientation, 0.0)
+}
+
+/// Set orientation with a scale supplied by the daemon's persisted settings.
+/// This avoids reading a transient `1.0` scale while GNOME rebuilds two logical
+/// monitors during a rotation.
+pub fn set_orientation_with_scale(orientation: &Orientation, scale: f64) -> Result<(), String> {
     match detect_backend() {
-        DisplayBackend::Gnome => set_gnome_orientation(orientation),
+        DisplayBackend::Gnome => set_gnome_orientation(orientation, Some(scale)),
         DisplayBackend::Kde => set_kde_orientation(orientation),
         DisplayBackend::Niri => set_niri_orientation(orientation),
         DisplayBackend::Unknown => {
@@ -1295,8 +1321,16 @@ Logical monitors:
     fn gnome_orientation_rotates_both_panels_from_baseline() {
         let args = build_gnome_orientation_args(&Orientation::Left, 1.66, 2);
         let joined = args.join(" ");
-        assert!(joined.contains("--left-of eDP-1"));
-        assert!(joined.contains("--monitor eDP-1 --transform 270"));
-        assert!(joined.contains("--monitor eDP-2 --left-of eDP-1 --transform 90"));
+        assert!(joined.contains("--right-of eDP-1"));
+        assert!(joined.contains("--monitor eDP-1 --transform 90"));
+        assert!(joined.contains("--monitor eDP-2 --right-of eDP-1 --transform 270"));
+    }
+
+    #[test]
+    fn decodes_the_main_panel_transform_from_its_upside_down_baseline() {
+        assert_eq!(zenbook_duo_primary_orientation(180), Orientation::Normal);
+        assert_eq!(zenbook_duo_primary_orientation(90), Orientation::Left);
+        assert_eq!(zenbook_duo_primary_orientation(270), Orientation::Right);
+        assert_eq!(zenbook_duo_primary_orientation(0), Orientation::Inverted);
     }
 }

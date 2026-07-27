@@ -14,10 +14,17 @@ pub struct RuntimeState {
     pub session_agent: SessionAgentState,
     #[serde(default)]
     pub usb_media_remap_reconcile: UsbMediaRemapReconcileState,
+    /// True only when this runtime successfully turned off an already-enabled eDP-2
+    /// while the keyboard was attached. It distinguishes an intentional dock-mode
+    /// change from xe having already disabled the connector after a link failure.
+    #[serde(default)]
+    pub secondary_panel_disabled_by_runtime: bool,
+    /// The kernel boot that owns `secondary_panel_disabled_by_runtime`. Ownership
+    /// survives a daemon restart, but is never trusted across a system reboot.
+    #[serde(default)]
+    pub secondary_panel_disabled_by_runtime_boot_id: Option<String>,
     #[serde(default)]
     pub last_runtime_notification: Option<RuntimeNotificationState>,
-    pub remembered_wifi_enabled: Option<bool>,
-    pub remembered_bluetooth_enabled: Option<bool>,
     pub last_updated: DateTime<Utc>,
     pub recent_events: Vec<HardwareEvent>,
 }
@@ -29,9 +36,9 @@ impl Default for RuntimeState {
             settings: DuoSettings::default(),
             session_agent: SessionAgentState::default(),
             usb_media_remap_reconcile: UsbMediaRemapReconcileState::default(),
+            secondary_panel_disabled_by_runtime: false,
+            secondary_panel_disabled_by_runtime_boot_id: None,
             last_runtime_notification: None,
-            remembered_wifi_enabled: None,
-            remembered_bluetooth_enabled: None,
             last_updated: Utc::now(),
             recent_events: Vec::new(),
         }
@@ -63,6 +70,34 @@ pub struct RuntimeNotificationState {
 }
 
 impl RuntimeState {
+    pub fn record_successful_dock_mode(
+        &mut self,
+        attached: bool,
+        secondary_panel_was_enabled: bool,
+    ) {
+        self.secondary_panel_disabled_by_runtime =
+            attached && (self.secondary_panel_disabled_by_runtime || secondary_panel_was_enabled);
+        self.secondary_panel_disabled_by_runtime_boot_id = if self
+            .secondary_panel_disabled_by_runtime
+        {
+            current_boot_id()
+        } else {
+            None
+        };
+    }
+
+    pub fn validate_secondary_panel_ownership_for_current_boot(&mut self) {
+        let current = current_boot_id();
+        let ownership_is_current = self.secondary_panel_disabled_by_runtime
+            && current.is_some()
+            && self.secondary_panel_disabled_by_runtime_boot_id == current;
+
+        if !ownership_is_current {
+            self.secondary_panel_disabled_by_runtime = false;
+            self.secondary_panel_disabled_by_runtime_boot_id = None;
+        }
+    }
+
     pub fn touch(&mut self) {
         self.last_updated = Utc::now();
     }
@@ -83,5 +118,85 @@ impl RuntimeState {
             .map_err(|e| format!("Failed to serialize runtime state: {e}"))?;
         fs::write(paths::state_file_path(), json)
             .map_err(|e| format!("Failed to write runtime state: {e}"))
+    }
+}
+
+fn current_boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeState;
+
+    #[test]
+    fn successful_attached_mode_records_runtime_ownership() {
+        let mut state = RuntimeState::default();
+
+        state.record_successful_dock_mode(true, true);
+
+        assert!(state.secondary_panel_disabled_by_runtime);
+        assert!(state.secondary_panel_disabled_by_runtime_boot_id.is_some());
+    }
+
+    #[test]
+    fn repeated_attached_mode_preserves_runtime_ownership() {
+        let mut state = RuntimeState {
+            secondary_panel_disabled_by_runtime: true,
+            ..RuntimeState::default()
+        };
+
+        state.record_successful_dock_mode(true, false);
+
+        assert!(state.secondary_panel_disabled_by_runtime);
+    }
+
+    #[test]
+    fn attached_mode_does_not_claim_an_already_failed_panel() {
+        let mut state = RuntimeState::default();
+
+        state.record_successful_dock_mode(true, false);
+
+        assert!(!state.secondary_panel_disabled_by_runtime);
+    }
+
+    #[test]
+    fn successful_detached_mode_clears_runtime_ownership() {
+        let mut state = RuntimeState {
+            secondary_panel_disabled_by_runtime: true,
+            ..RuntimeState::default()
+        };
+
+        state.record_successful_dock_mode(false, false);
+
+        assert!(!state.secondary_panel_disabled_by_runtime);
+        assert!(state.secondary_panel_disabled_by_runtime_boot_id.is_none());
+    }
+
+    #[test]
+    fn current_boot_ownership_survives_daemon_restart() {
+        let mut state = RuntimeState::default();
+        state.record_successful_dock_mode(true, true);
+
+        state.validate_secondary_panel_ownership_for_current_boot();
+
+        assert!(state.secondary_panel_disabled_by_runtime);
+    }
+
+    #[test]
+    fn stale_boot_ownership_is_discarded() {
+        let mut state = RuntimeState {
+            secondary_panel_disabled_by_runtime: true,
+            secondary_panel_disabled_by_runtime_boot_id: Some("previous-boot".into()),
+            ..RuntimeState::default()
+        };
+
+        state.validate_secondary_panel_ownership_for_current_boot();
+
+        assert!(!state.secondary_panel_disabled_by_runtime);
+        assert!(state.secondary_panel_disabled_by_runtime_boot_id.is_none());
     }
 }

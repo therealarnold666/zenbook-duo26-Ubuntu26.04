@@ -1,120 +1,16 @@
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::models::{ConnectionType, EventCategory, HardwareEvent};
 use crate::runtime::logger;
-use crate::runtime::policy::{PolicyAction, PolicyReason};
+use crate::runtime::policy::PolicyAction;
 use crate::runtime::state::RuntimeState;
 
-const EDGE_DEBOUNCE_MS: u64 = 400;
-const EDGE_FAST_TICKS: usize = 10;
-const EDGE_FAST_INTERVAL_MS: u64 = 150;
-const EDGE_SLOW_TICKS: usize = 14;
-const EDGE_SLOW_INTERVAL_MS: u64 = 500;
-const EDGE_REQUIRED_STABLE_TICKS: usize = 3;
-const EDGE_MAX_CYCLES: usize = 4;
-
-static EDGE_GUARD_COORDINATOR: OnceLock<Mutex<EdgeGuardCoordinator>> = OnceLock::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EdgeGuardExpectation {
-    edge_id: u64,
-    attached_after_edge: bool,
-    expected_wifi_on: bool,
-    expected_bluetooth_on: bool,
-}
-
-impl EdgeGuardExpectation {
-    fn from_inputs(edge_id: u64, attached_after_edge: bool) -> Self {
-        Self {
-            edge_id,
-            attached_after_edge,
-            expected_wifi_on: true,
-            expected_bluetooth_on: if attached_after_edge { false } else { true },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EdgeGuardRegisterOutcome {
-    Start {
-        expectation: EdgeGuardExpectation,
-        start_delay: Duration,
-    },
-    Merged {
-        edge_id: u64,
-    },
-}
-
-#[derive(Debug, Default)]
-struct EdgeGuardCoordinator {
-    active: bool,
-    next_edge_id: u64,
-    last_edge_at: Option<Instant>,
-    pending: Option<EdgeGuardExpectation>,
-}
-
-impl EdgeGuardCoordinator {
-    fn register_edge(
-        &mut self,
-        now: Instant,
-        attached_after_edge: bool,
-    ) -> EdgeGuardRegisterOutcome {
-        self.next_edge_id = self.next_edge_id.saturating_add(1);
-        let edge_id = self.next_edge_id;
-        let expectation = EdgeGuardExpectation::from_inputs(edge_id, attached_after_edge);
-        let previous_edge = self.last_edge_at;
-        self.last_edge_at = Some(now);
-
-        if self.active {
-            self.pending = Some(expectation);
-            return EdgeGuardRegisterOutcome::Merged { edge_id };
-        }
-
-        self.active = true;
-        let debounce_window = Duration::from_millis(EDGE_DEBOUNCE_MS);
-        let start_delay = previous_edge
-            .map(|last| debounce_remaining(now, last, debounce_window))
-            .unwrap_or(Duration::ZERO);
-        EdgeGuardRegisterOutcome::Start {
-            expectation,
-            start_delay,
-        }
-    }
-
-    fn take_pending(&mut self) -> Option<EdgeGuardExpectation> {
-        self.pending.take()
-    }
-
-    fn finish(&mut self) {
-        self.active = false;
-        self.pending = None;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EdgeGuardCycleResult {
-    recovered: bool,
-    checks: usize,
-    corrections: usize,
-    duration_ms: u128,
-}
-
-fn edge_guard_coordinator() -> &'static Mutex<EdgeGuardCoordinator> {
-    EDGE_GUARD_COORDINATOR.get_or_init(|| Mutex::new(EdgeGuardCoordinator::default()))
-}
-
-fn debounce_remaining(now: Instant, last: Instant, window: Duration) -> Duration {
-    let elapsed = now.saturating_duration_since(last);
-    if elapsed >= window {
-        Duration::ZERO
-    } else {
-        window - elapsed
-    }
-}
+const BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS: usize = 12;
+const BLUETOOTH_BACKLIGHT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub fn start(state: Arc<RwLock<RuntimeState>>) {
     tokio::spawn(async move {
@@ -152,15 +48,12 @@ pub fn start(state: Arc<RwLock<RuntimeState>>) {
                 guard.status = next_status;
                 let actions =
                     crate::runtime::policy::apply_transition_policy(&mut guard, &previous);
-                let keyboard_edge = previous.keyboard_attached != updated.keyboard_attached;
                 let _ = logger::append_line(format!(
-                    "rust-daemon: transition radios prev(wifi={},bt={}) current(wifi={},bt={}) remembered(wifi={:?},bt={:?}) actions=[{}]",
+                    "rust-daemon: transition radios prev(wifi={},bt={}) current(wifi={},bt={}) actions=[{}]",
                     previous.wifi_enabled,
                     previous.bluetooth_enabled,
                     updated.wifi_enabled,
                     updated.bluetooth_enabled,
-                    guard.remembered_wifi_enabled,
-                    guard.remembered_bluetooth_enabled,
                     summarize_actions(&actions)
                 ));
                 push_status_events(&mut guard, &previous, &updated);
@@ -170,9 +63,6 @@ pub fn start(state: Arc<RwLock<RuntimeState>>) {
                 }
                 drop(guard);
                 apply_policy_actions(state.clone(), actions).await;
-                if keyboard_edge {
-                    start_edge_radio_guard(state.clone(), updated.keyboard_attached);
-                }
             } else {
                 drop(guard);
             }
@@ -180,182 +70,6 @@ pub fn start(state: Arc<RwLock<RuntimeState>>) {
             reconcile_usb_media_remap(state.clone()).await;
         }
     });
-}
-
-fn start_edge_radio_guard(state: Arc<RwLock<RuntimeState>>, attached_after_edge: bool) {
-    tokio::spawn(async move {
-        let register_outcome = {
-            let mut coordinator = edge_guard_coordinator().lock().await;
-            coordinator.register_edge(Instant::now(), attached_after_edge)
-        };
-
-        let mut expectation = match register_outcome {
-            EdgeGuardRegisterOutcome::Merged { edge_id } => {
-                let _ = logger::append_line(format!(
-                    "rust-daemon: edge radio guard merged new edge into active guard (edge_id={})",
-                    edge_id
-                ));
-                return;
-            }
-            EdgeGuardRegisterOutcome::Start {
-                expectation,
-                start_delay,
-            } => {
-                if !start_delay.is_zero() {
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: edge radio guard debounce delay {}ms before start (edge_id={})",
-                        start_delay.as_millis(),
-                        expectation.edge_id
-                    ));
-                    tokio::time::sleep(start_delay).await;
-                }
-                expectation
-            }
-        };
-
-        for cycle_index in 0..EDGE_MAX_CYCLES {
-            let cycle = run_edge_guard_cycle(state.clone(), expectation).await;
-            let has_pending = {
-                let mut coordinator = edge_guard_coordinator().lock().await;
-                if let Some(next) = coordinator.take_pending() {
-                    expectation = next;
-                    true
-                } else {
-                    coordinator.finish();
-                    false
-                }
-            };
-
-            let _ = logger::append_line(format!(
-                "rust-daemon: edge radio guard cycle done edge_id={} recovered={} checks={} corrections={} duration_ms={} pending={}",
-                expectation.edge_id,
-                cycle.recovered,
-                cycle.checks,
-                cycle.corrections,
-                cycle.duration_ms,
-                has_pending
-            ));
-
-            if !has_pending {
-                break;
-            }
-
-            if cycle_index + 1 == EDGE_MAX_CYCLES {
-                let mut coordinator = edge_guard_coordinator().lock().await;
-                coordinator.finish();
-                let _ = logger::append_line(format!(
-                    "rust-daemon: edge radio guard reached max cycles {}; finishing with latest edge_id={}",
-                    EDGE_MAX_CYCLES,
-                    expectation.edge_id
-                ));
-            }
-        }
-    });
-}
-
-async fn run_edge_guard_cycle(
-    state: Arc<RwLock<RuntimeState>>,
-    expectation: EdgeGuardExpectation,
-) -> EdgeGuardCycleResult {
-    let started = Instant::now();
-    let mut checks = 0usize;
-    let mut corrections = 0usize;
-    let mut stable_streak = 0usize;
-    let phase_specs = [
-        ("fast", EDGE_FAST_TICKS, EDGE_FAST_INTERVAL_MS),
-        ("slow", EDGE_SLOW_TICKS, EDGE_SLOW_INTERVAL_MS),
-    ];
-
-    let _ = logger::append_line(format!(
-        "rust-daemon: edge radio guard start edge_id={} attached={} expected(wifi_on={},bt_on={}) phases=fast({}x{}ms),slow({}x{}ms)",
-        expectation.edge_id,
-        expectation.attached_after_edge,
-        expectation.expected_wifi_on,
-        expectation.expected_bluetooth_on,
-        EDGE_FAST_TICKS,
-        EDGE_FAST_INTERVAL_MS,
-        EDGE_SLOW_TICKS,
-        EDGE_SLOW_INTERVAL_MS
-    ));
-
-    for (phase_name, phase_ticks, phase_interval_ms) in phase_specs {
-        for _ in 0..phase_ticks {
-            tokio::time::sleep(Duration::from_millis(phase_interval_ms)).await;
-            checks = checks.saturating_add(1);
-
-            let mut actual_wifi = crate::runtime::probe::wifi_enabled();
-            let mut actual_bluetooth = crate::runtime::probe::bluetooth_enabled();
-
-            if expectation.expected_wifi_on && !actual_wifi {
-                if let Err(err) = crate::runtime::policy::set_wifi_enabled(true) {
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: edge radio guard corrective action failed edge_id={} phase={} action=wifi_on err={}",
-                        expectation.edge_id, phase_name, err
-                    ));
-                } else {
-                    corrections = corrections.saturating_add(1);
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: edge radio guard corrective action applied edge_id={} phase={} action=wifi_on",
-                        expectation.edge_id, phase_name
-                    ));
-                    actual_wifi = crate::runtime::probe::wifi_enabled();
-                    let mut guard = state.write().await;
-                    guard.status.wifi_enabled = actual_wifi;
-                    guard.touch();
-                    let _ = guard.save();
-                }
-            }
-
-            if expectation.expected_bluetooth_on && !actual_bluetooth {
-                if let Err(err) = crate::runtime::policy::set_bluetooth_enabled(true) {
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: edge radio guard corrective action failed edge_id={} phase={} action=bluetooth_on err={}",
-                        expectation.edge_id, phase_name, err
-                    ));
-                } else {
-                    corrections = corrections.saturating_add(1);
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: edge radio guard corrective action applied edge_id={} phase={} action=bluetooth_on",
-                        expectation.edge_id, phase_name
-                    ));
-                    actual_bluetooth = crate::runtime::probe::bluetooth_enabled();
-                    let mut guard = state.write().await;
-                    guard.status.bluetooth_enabled = actual_bluetooth;
-                    guard.touch();
-                    let _ = guard.save();
-                }
-            }
-
-            let wifi_ok = !expectation.expected_wifi_on || actual_wifi;
-            let bluetooth_ok = !expectation.expected_bluetooth_on || actual_bluetooth;
-            if wifi_ok && bluetooth_ok {
-                stable_streak = stable_streak.saturating_add(1);
-                if stable_streak >= EDGE_REQUIRED_STABLE_TICKS {
-                    let duration_ms = started.elapsed().as_millis();
-                    return EdgeGuardCycleResult {
-                        recovered: true,
-                        checks,
-                        corrections,
-                        duration_ms,
-                    };
-                }
-            } else {
-                stable_streak = 0;
-            }
-        }
-    }
-
-    let final_wifi = crate::runtime::probe::wifi_enabled();
-    let final_bluetooth = crate::runtime::probe::bluetooth_enabled();
-    let recovered = (!expectation.expected_wifi_on || final_wifi)
-        && (!expectation.expected_bluetooth_on || final_bluetooth);
-
-    EdgeGuardCycleResult {
-        recovered,
-        checks,
-        corrections,
-        duration_ms: started.elapsed().as_millis(),
-    }
 }
 
 async fn reconcile_usb_media_remap(state: Arc<RwLock<RuntimeState>>) {
@@ -468,50 +182,21 @@ async fn reconcile_usb_media_remap(state: Arc<RwLock<RuntimeState>>) {
 async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<PolicyAction>) {
     for action in actions {
         match action {
-            PolicyAction::SetWifi { enabled, reason } => {
-                if let Err(err) = crate::runtime::policy::set_wifi_enabled(enabled) {
-                    log::warn!("failed to set wifi policy action: {err}");
+            PolicyAction::EnsureBluetoothEnabled => {
+                if let Err(err) = crate::runtime::policy::ensure_bluetooth_enabled() {
+                    log::warn!("failed to ensure Bluetooth is enabled: {err}");
                     crate::runtime::daemon::notify_runtime_error(
                         &state,
                         "Zenbook Duo Runtime Error",
-                        &format!("Wi-Fi policy action failed: {err}"),
+                        &format!("Could not enable Bluetooth for detached keyboard: {err}"),
                     )
                     .await;
                     let _ = logger::append_line(format!(
-                        "rust-daemon: wifi policy action failed (enabled={}, reason={}): {}",
-                        enabled,
-                        reason_label(reason),
+                        "rust-daemon: ensure Bluetooth enabled on detach failed: {}",
                         err
                     ));
                 } else {
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: applied wifi policy action -> {} ({})",
-                        enabled,
-                        reason_label(reason)
-                    ));
-                }
-            }
-            PolicyAction::SetBluetooth { enabled, reason } => {
-                if let Err(err) = crate::runtime::policy::set_bluetooth_enabled(enabled) {
-                    log::warn!("failed to set bluetooth policy action: {err}");
-                    crate::runtime::daemon::notify_runtime_error(
-                        &state,
-                        "Zenbook Duo Runtime Error",
-                        &format!("Bluetooth policy action failed: {err}"),
-                    )
-                    .await;
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: bluetooth policy action failed (enabled={}, reason={}): {}",
-                        enabled,
-                        reason_label(reason),
-                        err
-                    ));
-                } else {
-                    let _ = logger::append_line(format!(
-                        "rust-daemon: applied bluetooth policy action -> {} ({})",
-                        enabled,
-                        reason_label(reason)
-                    ));
+                    let _ = logger::append_line("rust-daemon: ensured Bluetooth enabled on detach");
                 }
             }
             PolicyAction::SetBacklight(level) => {
@@ -547,7 +232,59 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
                     ));
                 }
             }
+            PolicyAction::SetBluetoothBacklight(level) => {
+                match set_bluetooth_backlight_when_ready(level).await {
+                    Ok(()) => {
+                        let mut guard = state.write().await;
+                        guard.status.backlight_level = level;
+                        guard.recent_events.push(HardwareEvent::info(
+                            EventCategory::Keyboard,
+                            format!("Backlight restored to {} over Bluetooth", level),
+                            "rust-daemon",
+                        ));
+                        guard.touch();
+                        if let Err(err) = guard.save() {
+                            log::warn!("failed to save Bluetooth backlight state: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("failed to restore Bluetooth backlight: {err}");
+                        crate::runtime::daemon::notify_runtime_error(
+                            &state,
+                            "Zenbook Duo Runtime Error",
+                            &format!("Bluetooth keyboard backlight restore failed: {err}"),
+                        )
+                        .await;
+                    }
+                }
+            }
             PolicyAction::SetDockMode { attached, scale } => {
+                let secondary_panel_was_enabled = crate::hardware::sysfs::secondary_panel_enabled();
+                let secondary_panel_disabled_by_runtime = {
+                    let guard = state.read().await;
+                    guard.secondary_panel_disabled_by_runtime
+                };
+
+                if should_skip_detached_secondary_recovery(
+                    attached,
+                    secondary_panel_was_enabled,
+                    secondary_panel_disabled_by_runtime,
+                ) {
+                    let message = "Skipping automatic dual-screen enable: xe reports eDP-2 disabled after the keyboard transition";
+                    log::warn!("{message}");
+                    crate::runtime::daemon::notify_runtime_error(
+                        &state,
+                        "Zenbook Duo Display Protection",
+                        "The xe driver has disabled eDP-2. Automatic dual-screen recovery was skipped to avoid a compositor freeze; reconnect the keyboard or reboot before retrying.",
+                    )
+                    .await;
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: {message} (attached={}, scale={})",
+                        attached, scale
+                    ));
+                    continue;
+                }
+
                 if let Err(err) =
                     crate::runtime::daemon::forward_or_queue_dock_mode(&state, attached, scale)
                         .await
@@ -571,6 +308,16 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
                         attached, scale, err
                     ));
                 } else {
+                    let mut guard = state.write().await;
+                    // Preserve ownership across repeated attached syncs. The replay path
+                    // also records this so startup and session-agent re-registration behave
+                    // the same as a physical keyboard transition.
+                    guard.record_successful_dock_mode(attached, secondary_panel_was_enabled);
+                    guard.touch();
+                    if let Err(err) = guard.save() {
+                        log::warn!("failed to save secondary panel dock state: {err}");
+                    }
+                    drop(guard);
                     let _ = logger::append_line(format!(
                         "rust-daemon: applied dock-mode policy action (attached={}, scale={})",
                         attached, scale
@@ -581,6 +328,14 @@ async fn apply_policy_actions(state: Arc<RwLock<RuntimeState>>, actions: Vec<Pol
     }
 }
 
+fn should_skip_detached_secondary_recovery(
+    attached: bool,
+    secondary_panel_enabled: bool,
+    secondary_panel_disabled_by_runtime: bool,
+) -> bool {
+    !attached && !secondary_panel_enabled && !secondary_panel_disabled_by_runtime
+}
+
 fn summarize_actions(actions: &[PolicyAction]) -> String {
     if actions.is_empty() {
         return "none".to_string();
@@ -588,13 +343,9 @@ fn summarize_actions(actions: &[PolicyAction]) -> String {
     actions
         .iter()
         .map(|action| match action {
-            PolicyAction::SetWifi { enabled, reason } => {
-                format!("wifi:{}:{}", enabled, reason_label(*reason))
-            }
-            PolicyAction::SetBluetooth { enabled, reason } => {
-                format!("bluetooth:{}:{}", enabled, reason_label(*reason))
-            }
+            PolicyAction::EnsureBluetoothEnabled => "bluetooth:ensure-enabled".to_string(),
             PolicyAction::SetBacklight(level) => format!("backlight:{}", level),
+            PolicyAction::SetBluetoothBacklight(level) => format!("bluetooth-backlight:{}", level),
             PolicyAction::SetDockMode { attached, scale } => {
                 format!("dock:attached={}:scale={}", attached, scale)
             }
@@ -603,11 +354,35 @@ fn summarize_actions(actions: &[PolicyAction]) -> String {
         .join(",")
 }
 
-fn reason_label(reason: PolicyReason) -> &'static str {
-    match reason {
-        PolicyReason::Normal => "normal",
-        PolicyReason::Corrective => "corrective",
+async fn set_bluetooth_backlight_when_ready(level: u8) -> Result<(), String> {
+    let mut last_error = String::from("Bluetooth HID device has not appeared yet");
+
+    for attempt in 1..=BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS {
+        match tokio::task::spawn_blocking(move || {
+            crate::hardware::hid::set_backlight_bluetooth(level)
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                let _ = logger::append_line(format!(
+                    "rust-daemon: restored Bluetooth backlight level={} attempt={}/{}",
+                    level, attempt, BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS
+                ));
+                return Ok(());
+            }
+            Ok(Err(err)) => last_error = err,
+            Err(err) => last_error = format!("Bluetooth backlight worker failed: {err}"),
+        }
+
+        if attempt < BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS {
+            tokio::time::sleep(BLUETOOTH_BACKLIGHT_RETRY_DELAY).await;
+        }
     }
+
+    Err(format!(
+        "after {} attempts: {}",
+        BLUETOOTH_BACKLIGHT_MAX_ATTEMPTS, last_error
+    ))
 }
 
 fn push_status_events(
@@ -714,71 +489,20 @@ fn orientation_label(orientation: &crate::models::Orientation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::should_skip_detached_secondary_recovery;
 
     #[test]
-    fn edge_expectation_matches_forced_edge_network_policy() {
-        let attached = EdgeGuardExpectation::from_inputs(1, true);
-        assert!(attached.expected_wifi_on);
-        assert!(!attached.expected_bluetooth_on);
-
-        let detached = EdgeGuardExpectation::from_inputs(2, false);
-        assert!(detached.expected_wifi_on);
-        assert!(detached.expected_bluetooth_on);
+    fn detached_recovery_is_allowed_after_runtime_disabled_the_panel() {
+        assert!(!should_skip_detached_secondary_recovery(false, false, true));
     }
 
     #[test]
-    fn debounce_remaining_returns_zero_outside_window() {
-        let base = Instant::now();
-        let outside = base + Duration::from_millis(EDGE_DEBOUNCE_MS + 10);
-        assert_eq!(
-            debounce_remaining(outside, base, Duration::from_millis(EDGE_DEBOUNCE_MS),),
-            Duration::ZERO
-        );
+    fn detached_recovery_is_blocked_when_xe_disabled_the_panel() {
+        assert!(should_skip_detached_secondary_recovery(false, false, false));
     }
 
     #[test]
-    fn register_edge_merges_when_guard_is_active() {
-        let mut coordinator = EdgeGuardCoordinator::default();
-        let base = Instant::now();
-        let first = coordinator.register_edge(base, true);
-        let first_expectation = match first {
-            EdgeGuardRegisterOutcome::Start {
-                expectation,
-                start_delay,
-            } => {
-                assert_eq!(start_delay, Duration::ZERO);
-                expectation
-            }
-            EdgeGuardRegisterOutcome::Merged { .. } => panic!("first edge should start guard"),
-        };
-        assert_eq!(first_expectation.edge_id, 1);
-
-        let second = coordinator.register_edge(base + Duration::from_millis(100), false);
-        let merged_edge_id = match second {
-            EdgeGuardRegisterOutcome::Merged { edge_id } => edge_id,
-            EdgeGuardRegisterOutcome::Start { .. } => panic!("second edge should be merged"),
-        };
-        assert_eq!(merged_edge_id, 2);
-        assert!(coordinator.pending.is_some());
-    }
-
-    #[test]
-    fn register_edge_applies_debounce_delay_when_recent_edge_exists() {
-        let mut coordinator = EdgeGuardCoordinator::default();
-        let base = Instant::now();
-        let _ = coordinator.register_edge(base, true);
-        coordinator.finish();
-
-        let second = coordinator.register_edge(base + Duration::from_millis(120), true);
-        match second {
-            EdgeGuardRegisterOutcome::Start { start_delay, .. } => {
-                assert!(start_delay > Duration::ZERO);
-                assert!(start_delay <= Duration::from_millis(EDGE_DEBOUNCE_MS));
-            }
-            EdgeGuardRegisterOutcome::Merged { .. } => {
-                panic!("inactive coordinator should start after debounce")
-            }
-        }
+    fn enabled_panel_never_needs_detached_recovery_protection() {
+        assert!(!should_skip_detached_secondary_recovery(false, true, false));
     }
 }

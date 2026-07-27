@@ -50,7 +50,7 @@ fn default_backlight() -> u8 {
 }
 
 fn default_scale() -> f64 {
-    1.66
+    1.67
 }
 
 fn default_usb_media_remap_enabled() -> bool {

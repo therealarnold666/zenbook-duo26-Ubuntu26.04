@@ -130,7 +130,7 @@ The experiment uses the current project GNOME detached baseline:
 
 This baseline is currently encoded in:
 
-- [display-recover.sh](/home/arnold/Projects/zenbook-duo-linux-main/debug/post-login-display-recovery/display-recover.sh)
+- `debug/post-login-display-recovery/display-recover.sh` (local investigation helper; not included in this repository snapshot)
 
 ## Problems Identified In The Recovery Design
 

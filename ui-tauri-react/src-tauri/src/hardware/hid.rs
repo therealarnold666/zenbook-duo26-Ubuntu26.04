@@ -79,18 +79,7 @@ pub fn set_backlight_usb(level: u8) -> Result<(), String> {
 pub fn set_backlight_bluetooth(level: u8) -> Result<(), String> {
     let level = level.min(3);
 
-    // Find the hidraw device for the Zenbook keyboard
-    let hidraw_path = find_bt_hidraw()?;
-
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&hidraw_path)
-        .map_err(|e| format!("Failed to open {hidraw_path}: {e}"))?;
-
-    let fd = file.as_raw_fd();
-
-    // Build the same payload
+    // Build the same payload.
     let mut data = [0u8; 16];
     data[0] = 0x5A;
     data[1] = 0xBA;
@@ -103,34 +92,68 @@ pub fn set_backlight_bluetooth(level: u8) -> Result<(), String> {
     // For 16 bytes: 0xC0104806
     let hidiocsfeature: libc::c_ulong = 0xC010_4806;
 
-    let ret = unsafe { libc::ioctl(fd, hidiocsfeature, data.as_mut_ptr()) };
+    let mut errors = Vec::new();
+    for hidraw_path in find_bt_hidraw()? {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&hidraw_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                errors.push(format!("{hidraw_path}: open failed: {err}"));
+                continue;
+            }
+        };
 
-    if ret < 0 {
-        return Err(format!(
-            "ioctl HIDIOCSFEATURE failed: {}",
+        let ret = unsafe { libc::ioctl(file.as_raw_fd(), hidiocsfeature, data.as_mut_ptr()) };
+        if ret >= 0 {
+            return Ok(());
+        }
+        errors.push(format!(
+            "{hidraw_path}: HIDIOCSFEATURE failed: {}",
             std::io::Error::last_os_error()
         ));
     }
 
-    Ok(())
+    Err(errors.join("; "))
 }
 
-fn find_bt_hidraw() -> Result<String, String> {
+fn find_bt_hidraw() -> Result<Vec<String>, String> {
     let hidraw_dir = Path::new("/sys/class/hidraw");
+    let mut candidates = Vec::new();
     if let Ok(entries) = fs::read_dir(hidraw_dir) {
         for entry in entries.flatten() {
             let uevent_path = entry.path().join("device/uevent");
             if let Ok(contents) = fs::read_to_string(&uevent_path) {
-                if (contents.contains("Zenbook Duo Keyboard") || contents.contains("ASUS_DUO"))
-                    && contents.contains("0005:")
+                if is_bluetooth_keyboard(&contents)
+                    && report_descriptor_supports_backlight(
+                        &entry.path().join("device/report_descriptor"),
+                    )
                 {
                     let name = entry.file_name();
-                    return Ok(format!("/dev/{}", name.to_string_lossy()));
+                    candidates.push(format!("/dev/{}", name.to_string_lossy()));
                 }
             }
         }
     }
-    Err("Bluetooth hidraw device not found".into())
+    candidates.sort();
+    if candidates.is_empty() {
+        Err("Bluetooth keyboard feature-report hidraw device not found".into())
+    } else {
+        Ok(candidates)
+    }
+}
+
+fn is_bluetooth_keyboard(uevent: &str) -> bool {
+    (uevent.contains("Zenbook Duo Keyboard") || uevent.contains("ASUS_DUO"))
+        && uevent.contains("HID_ID=0005:")
+}
+
+fn report_descriptor_supports_backlight(path: &Path) -> bool {
+    fs::read(path)
+        .map(|descriptor| descriptor.windows(2).any(|window| window == [0x85, 0x5A]))
+        .unwrap_or(false)
 }
 
 /// Set backlight, trying USB first then Bluetooth.
@@ -150,4 +173,18 @@ pub fn set_backlight(level: u8) -> Result<(), String> {
     Err(format!(
         "Failed to set keyboard backlight natively (usb: {usb_err}; bt: {bt_err})"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_bluetooth_keyboard_from_hid_uevent() {
+        let uevent = "HID_ID=0005:00000B05:00001CD7\nHID_NAME=ASUS Zenbook Duo Keyboard\n";
+        assert!(is_bluetooth_keyboard(uevent));
+        assert!(!is_bluetooth_keyboard(
+            "HID_ID=0003:00000B05:00001CD7\nHID_NAME=ASUS Zenbook Duo Keyboard"
+        ));
+    }
 }

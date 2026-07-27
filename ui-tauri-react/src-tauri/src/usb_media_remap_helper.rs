@@ -452,8 +452,7 @@ fn step_brightness(direction: &str) -> Result<(), String> {
     fs::write(primary.join("brightness"), next.to_string())
         .map_err(|e| format!("Failed to write primary brightness: {e}"))?;
 
-    let secondary = Path::new("/sys/class/backlight/card1-eDP-2-backlight");
-    if secondary.exists() {
+    if let Some(secondary) = crate::hardware::sysfs::secondary_backlight_dir() {
         let secondary_max = read_backlight_value(&secondary.join("max_brightness"))?;
         let mirrored = next.min(secondary_max);
         fs::write(secondary.join("brightness"), mirrored.to_string())
