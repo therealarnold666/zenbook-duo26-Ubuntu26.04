@@ -15,10 +15,17 @@ import type {
   HidrawCapture,
   UsbMediaRemapStatus,
   TouchscreenDevice,
+  BatteryStatus,
 } from "@/types/duo";
 
 // Status
 export const getStatus = () => invoke<DuoStatus>("get_status");
+
+// Battery
+export const getBatteryStatus = () =>
+  invoke<BatteryStatus>("get_battery_status");
+export const setChargeLimit = (limit: number) =>
+  invoke<BatteryStatus>("set_charge_limit", { limit });
 
 // Backlight
 export const getBacklight = () => invoke<number>("get_backlight");

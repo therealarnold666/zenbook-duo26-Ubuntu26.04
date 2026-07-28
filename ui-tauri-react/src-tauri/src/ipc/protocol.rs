@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::commands::usb_media_remap::UsbMediaRemapStatus;
-use crate::models::{DisplayLayout, DuoSettings, DuoStatus, HardwareEvent, Orientation};
+use crate::models::{
+    BatteryStatus, DisplayLayout, DuoSettings, DuoStatus, HardwareEvent, Orientation,
+};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +31,7 @@ pub enum DaemonRequest {
         phase: LifecyclePhase,
     },
     GetStatus,
+    GetBatteryStatus,
     GetDisplayLayout,
     GetSettings,
     SaveSettings {
@@ -36,6 +39,9 @@ pub enum DaemonRequest {
     },
     SetBacklight {
         level: u8,
+    },
+    SetChargeLimit {
+        limit: u8,
     },
     SetOrientation {
         orientation: Orientation,
@@ -74,6 +80,9 @@ pub enum DaemonResponse {
     Ack,
     Status {
         status: DuoStatus,
+    },
+    BatteryStatus {
+        status: BatteryStatus,
     },
     DisplayLayout {
         layout: DisplayLayout,

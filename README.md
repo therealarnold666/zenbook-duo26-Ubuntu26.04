@@ -21,6 +21,7 @@ The current known-good test system is Ubuntu 26.04 with GNOME on Wayland:
 - Additional validation parameters retained on the test machine:
   `xe.enable_psr=0 xe.enable_panel_replay=0`
 - Display scale: `1.67x`
+- Control panel version: `0.3.0`
 - Runtime services: system daemon, lifecycle helper, and user session agent
 
 Repeated cold boots, long GDM waits, desktop handoff, VS Code startup,
@@ -41,6 +42,8 @@ delta is provided in
 | USB and Bluetooth keyboard detection | Yes | UX8407AA USB ID `0b05:1cd7` |
 | Keyboard backlight boot/attach restore | Yes | Includes attach/detach state synchronization |
 | Display brightness synchronization | Yes | Dynamic eDP-2 sysfs detection plus Intel DPCD backlight mode |
+| Battery charge protection | Yes | Live Wh/power telemetry and persistent 80%, 90%, or 100% charge limits |
+| Internal audio | Kernel + UCM patches | Ghost RT722 quirk and CS35L56 + CS42L43 routing; see below |
 | Orientation controls | Yes | Corrects the main panel's physical 180-degree mounting baseline |
 | Dual-screen left/right arrangement | Yes | Uses the UX8407AA physical panel order |
 | Automatic sensor rotation | Partial | Session agent handles `monitor-sensor`; no UI on/off switch yet |
@@ -51,6 +54,24 @@ delta is provided in
 
 The runtime intentionally does not toggle Wi-Fi. On keyboard detach it only
 ensures that Bluetooth is powered, so the detached keyboard remains usable.
+
+### Battery charge protection
+
+The Status page includes a Battery card with the current charge in Wh,
+discharge power in W, charging state, and an 80%, 90%, or 100% charge-limit
+selector. The system daemon writes the selected limit through the kernel's
+standard ASUS battery interface:
+
+```text
+/sys/class/power_supply/BAT0/charge_control_end_threshold
+```
+
+The selection is saved in `~/.config/zenbook-duo/settings.json` and restored
+by the root daemon at startup. Linux 7.2 may initially report this ASUS
+threshold as unknown because the firmware cannot read it back; applying the
+saved value makes it readable for the current boot. The UI displays
+`Not applied` rather than claiming protection when the kernel does not confirm
+the requested value. A 100% limit restores normal full charging.
 
 ## Install
 
@@ -169,6 +190,56 @@ Build with a unique local version and keep a distribution kernel installed
 as a GRUB fallback. See
 [`UX8407AA_KERNEL_AND_RUNTIME_FIXES_2026-07-27.md`](UX8407AA_KERNEL_AND_RUNTIME_FIXES_2026-07-27.md)
 for evidence, failed experiments, and validation scope.
+
+### Missing internal audio
+
+UX8407AA firmware reports a non-existent RT722 on SoundWire link 3 alongside
+the real CS42L43. Both advertise a `SimpleJack` function, so `sof_sdw` tries
+to register `SDW3-Playback-SimpleJack` twice. ALSA card registration then
+fails with `-EEXIST`, leaving PipeWire with only `Dummy Output`.
+
+The kernel already removes the same ghost RT722 on several Panther Lake
+machines. This project extends that DMI quirk to the UX8407AA in
+[`patches/kernel/0002-ux8407aa-ignore-ghost-rt722.patch`](patches/kernel/0002-ux8407aa-ignore-ghost-rt722.patch).
+It preserves the real CS42L43, CS35L56 amplifiers, microphone, and HDMI audio.
+
+Apply `0001` and `0002` when building a complete custom kernel. To test only
+the audio fix against the currently running, matching 7.2-rc4 kernel:
+
+```bash
+./tools/build-audio-quirk.sh /path/to/linux-7.2-rc4
+sudo ./tools/build-audio-quirk.sh install /path/to/linux-7.2-rc4
+sudo reboot
+```
+
+When Secure Boot is enabled, the installer signs the override with Ubuntu's
+already enrolled DKMS MOK under `/var/lib/shim-signed/mok/`. It fails safely
+instead of installing an unsigned module when that key is unavailable.
+
+After reboot, `aplay -l` should show a SOF SoundWire card. Ubuntu 26.04's
+`alsa-ucm-conf` still predates upstream support for the combined
+`spk:cs35l56+cs42l43-spk` component string. Without the UCM backport,
+WirePlumber falls back to `Jack Out` even though the ALSA card exists.
+
+Install and activate the project-managed UCM backport:
+
+```bash
+./tools/configure-audio-ucm.sh validate
+sudo ./tools/configure-audio-ucm.sh install
+./tools/configure-audio-ucm.sh activate
+```
+
+`wpctl status` should now show `sof-soundwire Speaker` and
+`sof-soundwire Microphones`. The installer backs up the two distribution
+files it modifies under `/var/lib/zenbook-duo/audio-ucm-backup`.
+
+Remove both audio overrides if needed:
+
+```bash
+sudo ./tools/configure-audio-ucm.sh remove
+sudo ./tools/build-audio-quirk.sh remove
+sudo reboot
+```
 
 ## Runtime Design
 

@@ -18,6 +18,17 @@ export interface DuoStatus {
   orientation: Orientation;
 }
 
+export interface BatteryStatus {
+  present: boolean;
+  capacityPercent: number | null;
+  energyWh: number | null;
+  dischargePowerW: number | null;
+  state: string;
+  chargeLimitSupported: boolean;
+  configuredChargeLimitPercent: number;
+  activeChargeLimitPercent: number | null;
+}
+
 export interface DisplayInfo {
   connector: string;
   width: number;
@@ -55,6 +66,7 @@ export interface DuoSettings {
   usbMediaRemapEnabled: boolean;
   setupCompleted: boolean;
   touchscreenDisabled: string[];
+  chargeLimitPercent: number;
 }
 
 export interface TouchscreenDevice {

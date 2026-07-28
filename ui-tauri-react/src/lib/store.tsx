@@ -53,6 +53,7 @@ const defaultSettings: DuoSettings = {
   usbMediaRemapEnabled: true,
   setupCompleted: false,
   touchscreenDisabled: [],
+  chargeLimitPercent: 100,
 };
 
 const initialState: AppState = {

@@ -1,0 +1,56 @@
+--- a/codecs/cs42l43/init.conf
++++ b/codecs/cs42l43/init.conf
+@@ -1,4 +1,4 @@
+-# cs42l43 specific control settings
++# cs42l43-hs specific control settings
+ 
+ LibraryConfig.remap.Config {
+ 	ctl.default.map {
+@@ -8,10 +8,6 @@
+ 		"name='cs42l43 Headset Microphone Capture Volume'" {
+ 			"name='cs42l43 Decimator 1 Volume'".vindex.0 0
+ 		}
+-		"name='cs42l43 Speaker Playback Switch'" {
+-			"name='cs42l43 Speaker Digital Switch'".vindex.0 0
+-			"name='cs42l43 Speaker Digital Switch'".vindex.1 1
+-		}
+ 	}
+ }
+ 
+--- a/sof-soundwire/sof-soundwire.conf
++++ b/sof-soundwire/sof-soundwire.conf
+@@ -22,7 +22,7 @@
+ 
+ DefineRegex {
+ 	SpeakerCodec {
+-		Regex " spk:([a-z0-9]+((-sdca)|(-spk)|(-bridge))?(\\+[a-z0-9]+)?)"
++		Regex " spk:([a-z0-9]+((-sdca)|(-spk)|(-bridge))?(\\+[a-z0-9]+((-spk)?))?)"
+ 		String "${CardComponents}"
+ 	}
+ 	SpeakerChannels {
+@@ -55,6 +55,16 @@
+ 	}
+ }
+ 
++# Keep compatibility with kernels that expose two separate speaker tags.
++If.old_multi_spk {
++	Condition {
++		Type RegexMatch
++		Regex "(spk:cs42l43-spk .*spk:cs35l56( |$))|(spk:cs35l56 .*spk:cs42l43-spk( |$))"
++		String "${CardComponents}"
++	}
++	True.Define.SpeakerCodec1 "cs42l43-spk+cs35l56"
++}
++
+ If.multi_init {
+ 	Condition {
+ 		Type String
+@@ -108,7 +118,7 @@
+ If.spk_init {
+ 	Condition {
+ 		Type RegexMatch
+-		Regex "(rt1318(-1)?|cs35l56(-bridge)?)"
++		Regex "(rt1318(-1)?|cs42l43-spk(\\+cs35l56)?|cs35l56((-bridge)|(\\+cs42l43-spk))?)"
+ 		String "${var:SpeakerCodec1}"
+ 	}
+ 	True.Include.spk_init.File "/codecs/${var:SpeakerCodec1}/init.conf"

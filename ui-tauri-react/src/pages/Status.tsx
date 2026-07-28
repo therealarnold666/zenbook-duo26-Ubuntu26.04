@@ -5,6 +5,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useUsbMediaRemap } from "@/hooks/use-usb-media-remap";
+import { useBatteryStatus } from "@/hooks/use-battery-status";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   IconPlayerPause,
   IconPlayerPlay,
@@ -16,11 +24,13 @@ import {
   IconServer,
   IconBluetooth,
   IconPlugConnected,
+  IconBattery,
 } from "@tabler/icons-react";
 
 const cardAccents = {
   keyboard: { icon: "bg-teal-500/12 text-teal-500 dark:bg-teal-400/10 dark:text-teal-400", border: "border-l-teal-500/40" },
   display: { icon: "bg-blue-500/12 text-blue-500 dark:bg-blue-400/10 dark:text-blue-400", border: "border-l-blue-500/40" },
+  battery: { icon: "bg-amber-500/12 text-amber-600 dark:bg-amber-400/10 dark:text-amber-400", border: "border-l-amber-500/40" },
   connectivity: { icon: "bg-violet-500/12 text-violet-500 dark:bg-violet-400/10 dark:text-violet-400", border: "border-l-violet-500/40" },
   service: { icon: "bg-emerald-500/12 text-emerald-500 dark:bg-emerald-400/10 dark:text-emerald-400", border: "border-l-emerald-500/40" },
 } as const;
@@ -37,6 +47,8 @@ export default function Status() {
     setEnabled,
     togglePause,
   } = useUsbMediaRemap();
+  const { battery, loading: batteryLoading, settingLimit, updateChargeLimit } =
+    useBatteryStatus();
 
   const keyboardConnected = store.status.connectionType !== "none";
 
@@ -192,8 +204,79 @@ export default function Status() {
           </div>
         </div>
 
+        {/* Battery */}
+        <div className={cn("glass-card rounded-xl border-l-[3px] p-5 animate-stagger-in stagger-3", cardAccents.battery.border)}>
+          <div className="mb-4 flex items-center gap-2.5">
+            <div className={cn("flex size-7 items-center justify-center rounded-lg", cardAccents.battery.icon)}>
+              <IconBattery className="size-3.5" stroke={1.75} />
+            </div>
+            <h3 className="text-[13px] font-semibold text-foreground">Battery</h3>
+            <span className="ml-auto rounded-md bg-amber-500/10 px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums text-amber-600 dark:text-amber-400">
+              {battery.capacityPercent === null ? "--" : `${battery.capacityPercent}%`}
+            </span>
+          </div>
+          <div className="space-y-3">
+            <StatusRow label="Current charge">
+              <span className="font-mono text-xs tabular-nums">
+                {battery.energyWh === null ? "--" : `${battery.energyWh.toFixed(1)} Wh`}
+              </span>
+            </StatusRow>
+            <StatusRow label="Discharge">
+              <span className="font-mono text-xs tabular-nums">
+                {battery.dischargePowerW === null
+                  ? "--"
+                  : `${battery.dischargePowerW.toFixed(1)} W`}
+              </span>
+            </StatusRow>
+            <StatusRow label="State">
+              <span className="rounded-md bg-muted px-2 py-0.5 font-mono text-[11px] font-medium">
+                {battery.state}
+              </span>
+            </StatusRow>
+            <StatusRow label="Charge limit">
+              <div className="flex items-center gap-2">
+                <Select
+                  value={String(battery.configuredChargeLimitPercent)}
+                  onValueChange={(value) => void updateChargeLimit(value)}
+                  disabled={
+                    batteryLoading ||
+                    settingLimit ||
+                    !battery.chargeLimitSupported
+                  }
+                >
+                  <SelectTrigger size="sm" className="w-[76px] font-mono">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="80">80%</SelectItem>
+                    <SelectItem value="90">90%</SelectItem>
+                    <SelectItem value="100">100%</SelectItem>
+                  </SelectContent>
+                </Select>
+                {(batteryLoading || settingLimit) && <Spinner className="text-muted-foreground" />}
+                {!batteryLoading &&
+                  battery.chargeLimitSupported &&
+                  battery.activeChargeLimitPercent !==
+                    battery.configuredChargeLimitPercent && (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/30 text-[10px] text-amber-600 dark:text-amber-400"
+                    >
+                      Not applied
+                    </Badge>
+                  )}
+                {!batteryLoading && !battery.chargeLimitSupported && (
+                  <Badge variant="outline" className="text-[10px] text-muted-foreground">
+                    Unsupported
+                  </Badge>
+                )}
+              </div>
+            </StatusRow>
+          </div>
+        </div>
+
         {/* Connectivity */}
-        <div className={cn("glass-card rounded-xl border-l-[3px] p-5 animate-stagger-in stagger-3", cardAccents.connectivity.border)}>
+        <div className={cn("glass-card rounded-xl border-l-[3px] p-5 animate-stagger-in stagger-4", cardAccents.connectivity.border)}>
           <div className="mb-4 flex items-center gap-2.5">
             <div className={cn("flex size-7 items-center justify-center rounded-lg", cardAccents.connectivity.icon)}>
               <IconWifi className="size-3.5" stroke={1.75} />
@@ -227,7 +310,7 @@ export default function Status() {
         </div>
 
         {/* Service */}
-        <div className={cn("glass-card rounded-xl border-l-[3px] p-5 animate-stagger-in stagger-4", cardAccents.service.border)}>
+        <div className={cn("glass-card rounded-xl border-l-[3px] p-5 animate-stagger-in stagger-5", cardAccents.service.border)}>
           <div className="mb-4 flex items-center gap-2.5">
             <div className={cn("flex size-7 items-center justify-center rounded-lg", cardAccents.service.icon)}>
               <IconServer className="size-3.5" stroke={1.75} />

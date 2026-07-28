@@ -221,8 +221,12 @@ mod tests {
 
     #[test]
     fn bluetooth_enabled_requires_a_powered_bluez_controller() {
-        assert!(bluetooth_controller_powered("Controller AA:BB\n\tPowered: yes\n"));
-        assert!(!bluetooth_controller_powered("Controller AA:BB\n\tPowered: no\n"));
+        assert!(bluetooth_controller_powered(
+            "Controller AA:BB\n\tPowered: yes\n"
+        ));
+        assert!(!bluetooth_controller_powered(
+            "Controller AA:BB\n\tPowered: no\n"
+        ));
     }
 
     #[test]

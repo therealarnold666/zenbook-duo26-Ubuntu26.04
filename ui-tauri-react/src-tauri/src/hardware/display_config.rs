@@ -112,9 +112,8 @@ pub fn get_display_layout() -> Result<DisplayLayout, String> {
 }
 
 fn get_gnome_display_layout() -> Result<DisplayLayout, String> {
-    let output =
-        run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
-            .map_err(|e| format!("Failed to run gdctl: {e}"))?;
+    let output = run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
+        .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -892,7 +891,9 @@ fn run_command_output_with_timeout<S: AsRef<str>>(
             .args(&args_vec)
             .output()
             .map_err(|e| format!("Failed to run {program}: {e}")),
-        Err(err) => Err(format!("Failed to run timeout wrapper for {program}: {err}")),
+        Err(err) => Err(format!(
+            "Failed to run timeout wrapper for {program}: {err}"
+        )),
     }
 }
 
@@ -919,9 +920,8 @@ fn gnome_scale() -> Result<f64, String> {
 }
 
 fn gnome_logical_monitor_count() -> Result<usize, String> {
-    let output =
-        run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
-            .map_err(|e| format!("Failed to run gdctl: {e}"))?;
+    let output = run_command_output_with_timeout("gdctl", &["show"], DISPLAY_COMMAND_TIMEOUT_SECS)
+        .map_err(|e| format!("Failed to run gdctl: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(

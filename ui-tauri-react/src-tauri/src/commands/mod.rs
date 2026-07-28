@@ -1,4 +1,5 @@
 pub mod backlight;
+pub mod battery;
 pub mod diagnostics;
 pub mod display;
 pub mod events;

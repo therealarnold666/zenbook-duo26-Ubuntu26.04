@@ -19,6 +19,8 @@ pub struct DuoSettings {
     pub setup_completed: bool,
     #[serde(default)]
     pub touchscreen_disabled: Vec<String>,
+    #[serde(default = "default_charge_limit_percent")]
+    pub charge_limit_percent: u8,
 }
 
 impl Default for DuoSettings {
@@ -32,6 +34,7 @@ impl Default for DuoSettings {
             usb_media_remap_enabled: default_usb_media_remap_enabled(),
             setup_completed: false,
             touchscreen_disabled: Vec::new(),
+            charge_limit_percent: default_charge_limit_percent(),
         }
     }
 }
@@ -55,4 +58,21 @@ fn default_scale() -> f64 {
 
 fn default_usb_media_remap_enabled() -> bool {
     true
+}
+
+fn default_charge_limit_percent() -> u8 {
+    100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DuoSettings;
+
+    #[test]
+    fn older_settings_default_to_full_charge() {
+        let settings: DuoSettings =
+            serde_json::from_str(r#"{"defaultBacklight":2}"#).expect("deserialize settings");
+
+        assert_eq!(settings.charge_limit_percent, 100);
+    }
 }

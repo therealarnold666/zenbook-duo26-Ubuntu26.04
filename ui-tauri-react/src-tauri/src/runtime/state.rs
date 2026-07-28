@@ -77,13 +77,12 @@ impl RuntimeState {
     ) {
         self.secondary_panel_disabled_by_runtime =
             attached && (self.secondary_panel_disabled_by_runtime || secondary_panel_was_enabled);
-        self.secondary_panel_disabled_by_runtime_boot_id = if self
-            .secondary_panel_disabled_by_runtime
-        {
-            current_boot_id()
-        } else {
-            None
-        };
+        self.secondary_panel_disabled_by_runtime_boot_id =
+            if self.secondary_panel_disabled_by_runtime {
+                current_boot_id()
+            } else {
+                None
+            };
     }
 
     pub fn validate_secondary_panel_ownership_for_current_boot(&mut self) {

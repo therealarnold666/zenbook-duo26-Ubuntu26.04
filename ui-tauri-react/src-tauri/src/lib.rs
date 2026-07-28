@@ -49,6 +49,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::status::get_status,
+            commands::battery::get_battery_status,
+            commands::battery::set_charge_limit,
             commands::backlight::get_backlight,
             commands::backlight::set_backlight,
             commands::display::get_display_layout,

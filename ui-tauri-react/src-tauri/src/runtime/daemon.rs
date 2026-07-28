@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -135,6 +135,19 @@ fn initialize_state() -> RuntimeState {
     state.status = crate::runtime::probe::current_status();
     state.status.service_active = false;
     state.settings = commands::settings::load_settings_local();
+    let charge_limit = state.settings.charge_limit_percent;
+    match hardware::battery::set_charge_limit(charge_limit) {
+        Ok(_) => {
+            let _ = logger::append_line(format!(
+                "rust-daemon: restored battery charge limit -> {charge_limit}%"
+            ));
+        }
+        Err(error) => {
+            let _ = logger::append_line(format!(
+                "rust-daemon: battery charge limit restore unavailable: {error}"
+            ));
+        }
+    }
     state.session_agent = Default::default();
     state.validate_secondary_panel_ownership_for_current_boot();
     state.touch();
@@ -311,6 +324,12 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                 status.service_active = guard.session_agent.connected;
                 DaemonResponse::Status { status }
             }
+            DaemonRequest::GetBatteryStatus => {
+                let configured = state.read().await.settings.charge_limit_percent;
+                DaemonResponse::BatteryStatus {
+                    status: hardware::battery::read_status(configured),
+                }
+            }
             DaemonRequest::GetDisplayLayout => {
                 match request_session(state.clone(), SessionCommand::GetDisplayLayout, true).await {
                     Ok(SessionResponse::DisplayLayout { layout }) => {
@@ -361,6 +380,30 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                 }
                 Err(message) => DaemonResponse::Error { message },
             },
+            DaemonRequest::SetChargeLimit { limit } => {
+                match hardware::battery::set_charge_limit(limit) {
+                    Ok(status) => {
+                        let mut guard = state.write().await;
+                        guard.settings.charge_limit_percent = limit;
+                        match commands::settings::save_settings_local(guard.settings.clone()) {
+                            Ok(()) => {
+                                let _ = logger::append_line(format!(
+                                    "rust-daemon: set battery charge limit -> {limit}%"
+                                ));
+                                guard.touch();
+                                persist_state(&guard);
+                                DaemonResponse::BatteryStatus { status }
+                            }
+                            Err(message) => DaemonResponse::Error {
+                                message: format!(
+                                    "The {limit}% limit is active, but saving it failed: {message}"
+                                ),
+                            },
+                        }
+                    }
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
             DaemonRequest::SetOrientation { orientation } => {
                 apply_orientation(&state, orientation).await
             }
@@ -1180,8 +1223,8 @@ mod tests {
     use super::*;
     use crate::ipc::protocol::SessionBackend;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -1519,13 +1562,15 @@ mod tests {
                 match envelope.payload {
                     SessionCommand::GetDisplayLayout => {
                         calls += 1;
-                        let reply = serde_json::to_string(&Envelope::new(
-                            SessionResponse::DisplayLayout {
+                        let reply =
+                            serde_json::to_string(&Envelope::new(SessionResponse::DisplayLayout {
                                 layout: DisplayLayout { displays: vec![] },
-                            },
-                        ))
-                        .expect("encode layout");
-                        writer.write_all(reply.as_bytes()).await.expect("write layout");
+                            }))
+                            .expect("encode layout");
+                        writer
+                            .write_all(reply.as_bytes())
+                            .await
+                            .expect("write layout");
                         writer.write_all(b"\n").await.expect("terminate layout");
                     }
                     SessionCommand::SetDockMode { attached, scale } => {
@@ -1772,11 +1817,15 @@ mod tests {
 
     #[test]
     fn set_dock_mode_timeout_does_not_disconnect_session_agent() {
-        assert!(!should_disconnect_on_timeout(&SessionCommand::SetDockMode {
-            attached: false,
-            scale: 1.66,
-        }));
-        assert!(should_disconnect_on_timeout(&SessionCommand::GetDisplayLayout));
+        assert!(!should_disconnect_on_timeout(
+            &SessionCommand::SetDockMode {
+                attached: false,
+                scale: 1.66,
+            }
+        ));
+        assert!(should_disconnect_on_timeout(
+            &SessionCommand::GetDisplayLayout
+        ));
     }
 
     #[test]

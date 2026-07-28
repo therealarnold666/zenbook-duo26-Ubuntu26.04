@@ -15,6 +15,34 @@ pub struct DuoStatus {
     pub orientation: Orientation,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatteryStatus {
+    pub present: bool,
+    pub capacity_percent: Option<u8>,
+    pub energy_wh: Option<f64>,
+    pub discharge_power_w: Option<f64>,
+    pub state: String,
+    pub charge_limit_supported: bool,
+    pub configured_charge_limit_percent: u8,
+    pub active_charge_limit_percent: Option<u8>,
+}
+
+impl Default for BatteryStatus {
+    fn default() -> Self {
+        Self {
+            present: false,
+            capacity_percent: None,
+            energy_wh: None,
+            discharge_power_w: None,
+            state: "Unknown".into(),
+            charge_limit_supported: false,
+            configured_charge_limit_percent: 100,
+            active_charge_limit_percent: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectionType {
