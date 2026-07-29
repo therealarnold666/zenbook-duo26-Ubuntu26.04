@@ -1,0 +1,4 @@
+# ASUS Zenbook Duo UX8407AA's Intel HID accelerometer does not publish a
+# mount matrix through ACPI.  iio-sensor-proxy needs this property to turn the
+# raw acceleration axes into screen-orientation events.
+SUBSYSTEM=="iio", KERNEL=="iio:device*", KERNELS=="HID-SENSOR-200073.9.auto", ATTR{name}=="accel_3d", ENV{ACCEL_MOUNT_MATRIX}="1, 0, 0; 0, 1, 0; 0, 0, 1"

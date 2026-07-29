@@ -61,6 +61,7 @@ export interface DuoSettings {
   defaultBacklight: number;
   defaultScale: number;
   autoDualScreen: boolean;
+  autoRotate: boolean;
   syncBrightness: boolean;
   theme: ThemePreference;
   usbMediaRemapEnabled: boolean;

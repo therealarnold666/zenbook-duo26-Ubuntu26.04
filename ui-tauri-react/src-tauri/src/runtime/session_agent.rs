@@ -10,7 +10,7 @@ use evdev::{AbsoluteAxisType, Device, EventType};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
-use tokio::time::timeout;
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use crate::ipc::protocol::{
     DaemonRequest, DaemonResponse, Envelope, SessionBackend, SessionCommand, SessionResponse,
@@ -1044,54 +1044,97 @@ fn step_brightness(direction: &str) -> Result<(), String> {
 }
 
 async fn watch_rotation() -> Result<(), String> {
-    let mut child = TokioCommand::new("monitor-sensor")
-        .arg("--accel")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start monitor-sensor: {e}"))?;
+    // Some Intel ISH firmwares expose acceleration samples but never emit the
+    // orientation change notifications consumed by monitor-sensor. Read the
+    // IIO axes directly so those machines still support automatic rotation.
+    let mut timer = interval(Duration::from_millis(250));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_orientation: Option<Orientation> = None;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "monitor-sensor stdout unavailable".to_string())?;
-    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        timer.tick().await;
+        let Some(orientation) = read_accelerometer_orientation() else {
+            continue;
+        };
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| format!("Failed reading monitor-sensor output: {e}"))?
-    {
-        if let Some(orientation) = parse_rotation_line(&line) {
-            if let Err(err) = crate::hardware::display_config::set_orientation(&orientation) {
-                log::warn!("failed to apply accelerometer orientation: {err}");
-            }
+        if last_orientation.as_ref() == Some(&orientation) {
+            continue;
         }
-    }
+        last_orientation = Some(orientation.clone());
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("Failed waiting for monitor-sensor: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("monitor-sensor exited with status {status}"))
+        let settings = crate::commands::settings::load_settings_local();
+        let dual_screen = dual_screen_is_active();
+        if !settings.auto_rotate || !dual_screen {
+            continue;
+        }
+
+        if let Err(err) = crate::hardware::display_config::set_orientation_with_scale(
+            &orientation,
+            settings.default_scale,
+        ) {
+            log::warn!("failed to apply accelerometer orientation: {err}");
+        } else {
+            log::info!("applied accelerometer orientation: {orientation:?}");
+        }
     }
 }
 
-fn parse_rotation_line(line: &str) -> Option<Orientation> {
-    let value = line
-        .split("Accelerometer orientation changed:")
-        .nth(1)?
-        .trim();
-    match value {
-        "left-up" => Some(Orientation::Left),
-        "right-up" => Some(Orientation::Right),
-        "bottom-up" => Some(Orientation::Inverted),
-        "normal" => Some(Orientation::Normal),
-        _ => None,
+fn read_accelerometer_orientation() -> Option<Orientation> {
+    let device = fs::read_dir("/sys/bus/iio/devices")
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| fs::read_to_string(path.join("name")).ok().as_deref() == Some("accel_3d\n"))?;
+
+    let read_axis = |axis: &str| -> Option<i64> {
+        fs::read_to_string(device.join(format!("in_accel_{axis}_raw")))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let (x, y, z) = (read_axis("x")?, read_axis("y")?, read_axis("z")?);
+    let (abs_x, abs_y, abs_z) = (x.abs(), y.abs(), z.abs());
+
+    // Ignore face-up/face-down positions. In those positions the z axis is
+    // dominant and there is no unambiguous screen orientation.
+    if abs_z >= abs_x.max(abs_y) {
+        return None;
     }
+
+    let orientation = if abs_x > abs_y {
+        if x >= 0 {
+            Orientation::Right
+        } else {
+            Orientation::Left
+        }
+    } else if y >= 0 {
+        Orientation::Inverted
+    } else {
+        Orientation::Normal
+    };
+
+    Some(orientation)
+}
+
+fn dual_screen_is_active() -> bool {
+    // `gdctl` is the authoritative source for the active GNOME logical
+    // monitors.  Do not route this guard through the generic layout parser:
+    // a transient compositor refresh can omit a monitor there and suppress an
+    // otherwise valid rotation event.
+    Command::new("gdctl")
+        .arg("show")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.contains("Logical monitor #"))
+                .count()
+                >= 2
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

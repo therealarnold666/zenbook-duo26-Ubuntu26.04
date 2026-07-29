@@ -46,7 +46,7 @@ delta is provided in
 | Internal audio | Kernel + UCM patches | Ghost RT722 quirk and CS35L56 + CS42L43 routing; see below |
 | Orientation controls | Yes | Corrects the main panel's physical 180-degree mounting baseline |
 | Dual-screen left/right arrangement | Yes | Uses the UX8407AA physical panel order |
-| Automatic sensor rotation | Partial | Session agent handles `monitor-sensor`; no UI on/off switch yet |
+| Automatic sensor rotation | Yes | Optional Controls switch; rotates both enabled panels from the Intel ISH accelerometer |
 | `1.67x` display scaling | Yes | Default and selectable in the control panel |
 | Media and ASUS function keys | Yes | USB and Bluetooth support varies by key |
 | Control panel and tray icon | Yes | Tauri/React application |
@@ -54,6 +54,37 @@ delta is provided in
 
 The runtime intentionally does not toggle Wi-Fi. On keyboard detach it only
 ensures that Bluetooth is powered, so the detached keyboard remains usable.
+
+### Automatic dual-screen rotation
+
+The **Controls → Screen Orientation** card includes an **Auto rotate** switch.
+It is off by default. When enabled, the session agent reads the Intel ISH
+accelerometer directly and rotates both panels only while two GNOME logical
+monitors are active. This avoids accidental layout changes in single-screen
+or keyboard-attached mode.
+
+The UX8407AA needs working Intel ISH sensor firmware. Confirm the sensor is
+available with:
+
+```bash
+monitor-sensor --accel
+```
+
+For systems whose firmware does not publish a mount matrix, install the
+included local udev rule and restart the proxy once:
+
+```bash
+sudo install -D -m 0644 system/udev/61-asus-ux8407aa-sensors.rules \
+  /etc/udev/rules.d/61-asus-ux8407aa-sensors.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=iio --sysname-match='iio:device0'
+sudo systemctl restart iio-sensor-proxy.service
+systemctl --user restart zenbook-duo-session-agent.service
+```
+
+Rotate the device left or right while keeping the displays facing you; a
+face-up or face-down position is intentionally ignored because it has no
+unambiguous screen orientation.
 
 ### Battery charge protection
 

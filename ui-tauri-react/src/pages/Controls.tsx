@@ -44,6 +44,16 @@ export default function Controls() {
     }
   };
 
+  const handleAutoRotateToggle = async (autoRotate: boolean) => {
+    const settings = { ...store.settings, autoRotate };
+    try {
+      await saveSettings(settings);
+      dispatch({ type: "SET_SETTINGS", payload: settings });
+    } catch (err) {
+      console.error("Failed to save auto-rotate setting:", err);
+    }
+  };
+
   const handleRestart = async () => {
     setRestarting(true);
     setRestarted(false);
@@ -87,18 +97,28 @@ export default function Controls() {
         </div>
 
         <div className="glass-card animate-stagger-in stagger-2 rounded-xl p-5">
-          <div className="mb-5 flex items-center gap-2.5">
-            <div className="flex size-7 items-center justify-center rounded-lg bg-blue-500/12 text-blue-500 dark:bg-blue-400/10 dark:text-blue-400">
-              <IconRotate className="size-3.5" stroke={1.75} />
+          <div className="mb-5 flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-7 items-center justify-center rounded-lg bg-blue-500/12 text-blue-500 dark:bg-blue-400/10 dark:text-blue-400">
+                <IconRotate className="size-3.5" stroke={1.75} />
+              </div>
+              <div>
+                <h3 className="text-[13px] font-semibold text-foreground">
+                  Screen Orientation
+                </h3>
+                <p className="text-[11px] text-muted-foreground">
+                  Current: <span className="font-mono capitalize">{store.status.orientation}</span>
+                </p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-[13px] font-semibold text-foreground">
-                Screen Orientation
-              </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Current: <span className="font-mono capitalize">{store.status.orientation}</span>
-              </p>
-            </div>
+            <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              Auto rotate
+              <Switch
+                checked={store.settings.autoRotate}
+                onCheckedChange={handleAutoRotateToggle}
+                aria-label="Automatically rotate both displays"
+              />
+            </label>
           </div>
           <OrientationButtons />
         </div>

@@ -10,6 +10,8 @@ pub struct DuoSettings {
     #[serde(default)]
     pub auto_dual_screen: bool,
     #[serde(default)]
+    pub auto_rotate: bool,
+    #[serde(default)]
     pub sync_brightness: bool,
     #[serde(default)]
     pub theme: ThemePreference,
@@ -29,6 +31,7 @@ impl Default for DuoSettings {
             default_backlight: default_backlight(),
             default_scale: default_scale(),
             auto_dual_screen: true,
+            auto_rotate: false,
             sync_brightness: true,
             theme: ThemePreference::System,
             usb_media_remap_enabled: default_usb_media_remap_enabled(),
@@ -74,5 +77,6 @@ mod tests {
             serde_json::from_str(r#"{"defaultBacklight":2}"#).expect("deserialize settings");
 
         assert_eq!(settings.charge_limit_percent, 100);
+        assert!(!settings.auto_rotate);
     }
 }

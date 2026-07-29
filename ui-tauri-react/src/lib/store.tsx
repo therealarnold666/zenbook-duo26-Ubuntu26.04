@@ -48,6 +48,7 @@ const defaultSettings: DuoSettings = {
   defaultBacklight: 3,
   defaultScale: 1.67,
   autoDualScreen: true,
+  autoRotate: false,
   syncBrightness: true,
   theme: "system",
   usbMediaRemapEnabled: true,
