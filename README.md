@@ -82,6 +82,14 @@ sudo systemctl restart iio-sensor-proxy.service
 systemctl --user restart zenbook-duo-session-agent.service
 ```
 
+### Touchscreen alignment
+
+The main panel is physically mounted 180 degrees from its usable display
+orientation. The GNOME setup script installs a libinput calibration rule for
+the primary RAYD touchscreen, and persists each internal touchscreen's GNOME
+output assignment. After a manual rule installation, reboot once (or rebind
+the touchscreen device) before testing it.
+
 Rotate the device left or right while keeping the displays facing you; a
 face-up or face-down position is intentionally ignored because it has no
 unambiguous screen orientation.
