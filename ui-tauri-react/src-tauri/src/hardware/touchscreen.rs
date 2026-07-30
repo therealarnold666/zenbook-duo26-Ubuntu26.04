@@ -11,11 +11,15 @@ pub struct TouchscreenDevice {
     pub enabled: bool,
 }
 
-/// Maps ELAN model number to display connector.
-fn elan_to_connector(name: &str) -> Option<&'static str> {
-    if name.contains("ELAN9008") {
+/// Maps the touchscreen ACPI HID to its physically attached panel.
+///
+/// UX8407AA units shipped with both ELAN and Raydium/RAYD controllers.  The
+/// latter is what this machine exposes, so keep the legacy ELAN mapping while
+/// recognizing the actual RAYD ACPI IDs as well.
+fn touchscreen_to_connector(name: &str) -> Option<&'static str> {
+    if name.contains("ELAN9008") || name.contains("RAYD0001") {
         Some("eDP-1")
-    } else if name.contains("ELAN9009") {
+    } else if name.contains("ELAN9009") || name.contains("RAYD0002") {
         Some("eDP-2")
     } else {
         None
@@ -41,14 +45,14 @@ pub fn list_touchscreens() -> Vec<TouchscreenDevice> {
     };
     for entry in i2c_devices.flatten() {
         let i2c_id = entry.file_name().to_string_lossy().to_string();
-        if !i2c_id.starts_with("i2c-ELAN") {
+        if !i2c_id.starts_with("i2c-ELAN") && !i2c_id.starts_with("i2c-RAYD") {
             continue;
         }
         let name = match read_i2c_device_name(&i2c_id) {
             Some(n) => n,
             None => continue,
         };
-        let connector = match elan_to_connector(&name) {
+        let connector = match touchscreen_to_connector(&name) {
             Some(c) => c.to_string(),
             None => continue,
         };
@@ -60,6 +64,17 @@ pub fn list_touchscreens() -> Vec<TouchscreenDevice> {
         });
     }
     devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::touchscreen_to_connector;
+
+    #[test]
+    fn maps_ux8407aa_raydium_touchscreens_to_their_panels() {
+        assert_eq!(touchscreen_to_connector("RAYD0001:00"), Some("eDP-1"));
+        assert_eq!(touchscreen_to_connector("RAYD0002:00"), Some("eDP-2"));
+    }
 }
 
 pub fn set_touchscreen_enabled(i2c_id: &str, enabled: bool) -> Result<(), String> {
