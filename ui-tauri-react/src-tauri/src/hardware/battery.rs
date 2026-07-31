@@ -18,6 +18,13 @@ pub fn read_status(configured_charge_limit_percent: u8) -> BatteryStatus {
     read_status_from(&path, configured_charge_limit_percent)
 }
 
+/// Returns true only when the kernel reports that the internal battery is
+/// actively discharging. This is the reliable signal for an unplugged system;
+/// `Not charging` can still occur while external power is connected.
+pub fn is_discharging() -> bool {
+    is_discharging_state(&read_status(100).state)
+}
+
 pub fn set_charge_limit(limit: u8) -> Result<BatteryStatus, String> {
     validate_charge_limit(limit)?;
     let battery_path = find_battery_path(Path::new(POWER_SUPPLY_DIR))
@@ -186,4 +193,16 @@ mod tests {
         assert!(validate_charge_limit(100).is_ok());
         assert!(validate_charge_limit(79).is_err());
     }
+
+    #[test]
+    fn recognizes_only_discharging_as_battery_power() {
+        assert!(is_discharging_state("Discharging"));
+        assert!(is_discharging_state("discharging"));
+        assert!(!is_discharging_state("Charging"));
+        assert!(!is_discharging_state("Not charging"));
+    }
+}
+
+fn is_discharging_state(state: &str) -> bool {
+    state.eq_ignore_ascii_case("discharging")
 }

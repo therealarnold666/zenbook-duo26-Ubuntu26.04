@@ -41,7 +41,8 @@ delta is provided in
 | Bluetooth recovery on keyboard detach | Yes | Does not change Wi-Fi state |
 | USB and Bluetooth keyboard detection | Yes | UX8407AA USB ID `0b05:1cd7` |
 | Keyboard backlight boot/attach restore | Yes | Includes attach/detach state synchronization |
-| Display brightness synchronization | Yes | Dynamic eDP-2 sysfs detection plus Intel DPCD backlight mode |
+| Display brightness synchronization | Yes | Keeps the last selected percentage across keyboard attach/detach and lower-panel transitions |
+| Performance profiles and battery saver | Yes | Quiet, Balanced, and Performance profiles; optionally enters Quiet on battery and restores the previous mode on AC |
 | Battery charge protection | Yes | Live Wh/power telemetry and persistent 80%, 90%, or 100% charge limits |
 | Internal audio | Kernel + UCM patches | Ghost RT722 quirk and CS35L56 + CS42L43 routing; see below |
 | Orientation controls | Yes | Corrects the main panel's physical 180-degree mounting baseline |
@@ -49,6 +50,7 @@ delta is provided in
 | Automatic sensor rotation | Yes | Optional Controls switch; rotates both enabled panels from the Intel ISH accelerometer |
 | `1.67x` display scaling | Yes | Default and selectable in the control panel |
 | Media and ASUS function keys | Yes | USB and Bluetooth support varies by key |
+| F12 Control shortcut | Yes | Brings the Zenbook Duo Control window to the foreground, or starts it if needed |
 | Control panel and tray icon | Yes | Tauri/React application |
 | Suspend/resume and session recovery | Yes | Lifecycle and startup replay are boot-aware |
 
@@ -111,6 +113,27 @@ threshold as unknown because the firmware cannot read it back; applying the
 saved value makes it readable for the current boot. The UI displays
 `Not applied` rather than claiming protection when the kernel does not confirm
 the requested value. A 100% limit restores normal full charging.
+
+### Performance profiles and battery saver
+
+The **Controls → Performance Mode** card offers Quiet, Balanced, and
+Performance profiles. Its **Battery saver** switch is off by default. When
+enabled, the daemon records the selected profile and switches to Quiet only
+while `BAT0` reports `Discharging`. On AC power (including a connected adapter
+that reports `Not charging`), it restores the recorded profile. A manual
+profile selection cancels a pending automatic restore.
+
+### Brightness and F12 shortcut
+
+Brightness is stored as a percentage and applied to every active internal
+panel. The session agent ignores the brief firmware maximum-brightness report
+that can occur while the keyboard is attached or detached, then reapplies the
+saved level once the display topology is stable. Brightness hotkeys update the
+same saved value.
+
+F12 opens Zenbook Duo Control. If the control panel is already running in the
+tray, F12 restores it and brings it to the foreground. The mapping works for
+both the docked USB keyboard and the detached Bluetooth keyboard.
 
 ## Install
 

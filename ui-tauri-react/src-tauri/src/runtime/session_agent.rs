@@ -1,9 +1,9 @@
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use evdev::{AbsoluteAxisType, Device, EventType};
@@ -20,6 +20,7 @@ use crate::runtime::{paths, state::RuntimeState};
 
 const DOCK_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const DOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
+const KEYBOARD_BACKLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn run() -> Result<(), String> {
     ensure_user_runtime_dir()?;
@@ -772,20 +773,63 @@ fn send_runtime_notification(title: &str, message: &str, urgent: bool) -> Result
 async fn watch_brightness_sync() -> Result<(), String> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut last_seen: Option<u32> = None;
+    let mut last_keyboard_attached: Option<bool> = None;
+    let mut topology_settles_at: Option<Instant> = None;
 
     loop {
         interval.tick().await;
 
-        if !brightness_sync_enabled() || keyboard_attached_from_runtime() {
+        if !brightness_sync_enabled() {
+            last_seen = None;
+            last_keyboard_attached = None;
+            topology_settles_at = None;
+            continue;
+        }
+
+        let keyboard_attached = keyboard_attached_from_runtime();
+        if last_keyboard_attached != Some(keyboard_attached) {
+            // Changing dock mode can make firmware temporarily report maximum
+            // brightness while eDP-2 is disabled or re-enabled. Do not adopt
+            // that transient value as a user brightness selection.
+            last_keyboard_attached = Some(keyboard_attached);
+            topology_settles_at = Some(Instant::now() + Duration::from_secs(3));
+            last_seen = None;
+            continue;
+        }
+
+        if let Some(settles_at) = topology_settles_at {
+            if Instant::now() < settles_at {
+                continue;
+            }
+
+            topology_settles_at = None;
+            let settings = crate::commands::settings::load_settings_local();
+            if let Some(percent) = settings.last_display_brightness_percent {
+                // Reapply only the user's persisted level after the display
+                // topology is stable, so both panels retain it across a dock
+                // or undock operation.
+                set_display_brightness(percent)?;
+            }
+            last_seen = Some(crate::hardware::sysfs::read_display_brightness());
             continue;
         }
 
         let level = crate::hardware::sysfs::read_display_brightness();
+        let max = crate::hardware::sysfs::read_max_brightness();
+        if level == 0 || max == 0 {
+            continue;
+        }
+
+        if last_seen.is_none() {
+            last_seen = Some(level);
+            continue;
+        }
+
         if last_seen == Some(level) {
             continue;
         }
 
-        sync_secondary_brightness(level)?;
+        set_display_brightness(brightness_percent(level, max))?;
         last_seen = Some(level);
     }
 }
@@ -804,43 +848,18 @@ fn keyboard_attached_from_runtime() -> bool {
     state.status.keyboard_attached
 }
 
-fn sync_secondary_brightness(level: u32) -> Result<(), String> {
-    let Some(secondary_path) = crate::hardware::sysfs::secondary_backlight_brightness_path() else {
-        return Ok(());
-    };
+fn brightness_percent(level: u32, max: u32) -> u8 {
+    ((level.saturating_mul(100) + max / 2) / max).min(100) as u8
+}
 
-    if fs::write(&secondary_path, level.to_string()).is_ok() {
-        return Ok(());
-    }
-
-    let mut child = Command::new("sudo")
-        .arg("/usr/bin/tee")
-        .arg(&secondary_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run sudo tee for brightness sync: {e}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(level.to_string().as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|e| format!("Failed to write brightness sync value: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed waiting for brightness sync helper: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Brightness sync failed for {}: {}",
-            secondary_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+fn set_display_brightness(percent: u8) -> Result<(), String> {
+    match crate::runtime::client::request(DaemonRequest::SetDisplayBrightness { percent }) {
+        Ok(DaemonResponse::Ack) => Ok(()),
+        Ok(DaemonResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!(
+            "Unexpected daemon response while setting display brightness: {other:?}"
+        )),
+        Err(message) => Err(message),
     }
 }
 
@@ -867,15 +886,40 @@ fn watch_keyboard_hotkeys() -> Result<(), String> {
             continue;
         }
 
+        let mut last_input = Instant::now();
+        let mut last_power_save_check = Instant::now();
+        let mut backlight_disabled_for_idle = false;
+
         loop {
             let mut lost_device = false;
             for (path, device) in &mut opened {
                 match device.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            if event.event_type() == EventType::ABSOLUTE
-                                && is_hotkey_abs_code(event.code())
-                            {
+                            let is_keyboard_input =
+                                event.event_type() == EventType::KEY && event.value() != 0;
+                            let is_known_hotkey = event.event_type() == EventType::ABSOLUTE
+                                && is_hotkey_abs_code(event.code());
+                            if is_keyboard_input || is_known_hotkey {
+                                last_input = Instant::now();
+                                if backlight_disabled_for_idle {
+                                    let restore_level =
+                                        crate::commands::settings::load_settings_local()
+                                            .default_backlight;
+                                    if restore_level > 0 {
+                                        if let Err(err) =
+                                            crate::commands::backlight::set_backlight_daemon_first(
+                                                restore_level,
+                                            )
+                                        {
+                                            log::warn!("failed to restore keyboard backlight after input: {err}");
+                                        }
+                                    }
+                                    backlight_disabled_for_idle = false;
+                                }
+                            }
+
+                            if is_known_hotkey {
                                 let value = event.value();
                                 if let Err(err) = handle_abs_misc_value(value) {
                                     log::warn!(
@@ -886,6 +930,13 @@ fn watch_keyboard_hotkeys() -> Result<(), String> {
                                         err
                                     );
                                 }
+                            }
+
+                            if event.event_type() == EventType::KEY
+                                && event.code() == evdev::Key::KEY_F12.code()
+                                && event.value() == 1
+                            {
+                                open_control_window();
                             }
                         }
                     }
@@ -901,11 +952,136 @@ fn watch_keyboard_hotkeys() -> Result<(), String> {
                 break;
             }
 
+            if last_power_save_check.elapsed() >= Duration::from_secs(1) {
+                last_power_save_check = Instant::now();
+                let settings = crate::commands::settings::load_settings_local();
+                if !settings.keyboard_backlight_power_save {
+                    last_input = Instant::now();
+                    backlight_disabled_for_idle = false;
+                } else if main_screen_is_off() {
+                    if !backlight_disabled_for_idle
+                        && crate::hardware::sysfs::read_backlight_level() > 0
+                    {
+                        match crate::commands::backlight::set_backlight_daemon_first(0) {
+                            Ok(()) => {
+                                backlight_disabled_for_idle = true;
+                                log::info!("disabled keyboard backlight while main display is off");
+                            }
+                            Err(err) => log::warn!(
+                                "failed to disable keyboard backlight for display-off: {err}"
+                            ),
+                        }
+                    }
+                } else if keyboard_attached_from_runtime() {
+                    // Keep the idle timer paused while docked. If display-off
+                    // power save turned the light off, the next key press
+                    // restores it through the normal input path above.
+                    last_input = Instant::now();
+                } else if !backlight_disabled_for_idle
+                    && last_input.elapsed() >= KEYBOARD_BACKLIGHT_IDLE_TIMEOUT
+                    && crate::hardware::sysfs::read_backlight_level() > 0
+                {
+                    match crate::commands::backlight::set_backlight_daemon_first(0) {
+                        Ok(()) => {
+                            backlight_disabled_for_idle = true;
+                            log::info!("disabled detached keyboard backlight after inactivity");
+                        }
+                        Err(err) => log::warn!("failed to disable idle keyboard backlight: {err}"),
+                    }
+                }
+            }
+
             std::thread::sleep(Duration::from_millis(50));
         }
 
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn main_screen_is_off() -> bool {
+    let backlight_off = fs::read_to_string("/sys/class/backlight/intel_backlight/bl_power")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(false)
+        || fs::read_to_string("/sys/class/backlight/intel_backlight/brightness")
+            .map(|value| value.trim() == "0")
+            .unwrap_or(false);
+    if backlight_off {
+        return true;
+    }
+
+    let dpms_off = fs::read_to_string("/sys/class/drm/card0-eDP-1/dpms")
+        .map(|value| value.trim() != "On")
+        .unwrap_or(false);
+    if dpms_off {
+        return true;
+    }
+
+    let screen_saver_active = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.ScreenSaver",
+            "--object-path",
+            "/org/gnome/ScreenSaver",
+            "--method",
+            "org.gnome.ScreenSaver.GetActive",
+        ])
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("true")
+        })
+        .unwrap_or(false);
+    if screen_saver_active {
+        return true;
+    }
+
+    gnome_idle_timeout_ms()
+        .zip(gnome_idle_time_ms())
+        .is_some_and(|(timeout, idle)| timeout > 0 && idle >= timeout)
+}
+
+fn gnome_idle_timeout_ms() -> Option<u64> {
+    static IDLE_TIMEOUT_MS: OnceLock<Option<u64>> = OnceLock::new();
+    *IDLE_TIMEOUT_MS.get_or_init(|| {
+        let output = Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.session", "idle-delay"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|value| !value.is_empty())?
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds * 1_000)
+    })
+}
+
+fn gnome_idle_time_ms() -> Option<u64> {
+    let output = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Mutter.IdleMonitor",
+            "--object-path",
+            "/org/gnome/Mutter/IdleMonitor/Core",
+            "--method",
+            "org.gnome.Mutter.IdleMonitor.GetIdletime",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|value| !value.is_empty())?
+        .parse()
+        .ok()
 }
 
 fn find_keyboard_abs_devices() -> Result<Vec<std::path::PathBuf>, String> {
@@ -934,13 +1110,15 @@ fn find_keyboard_abs_devices() -> Result<Vec<std::path::PathBuf>, String> {
             continue;
         }
 
-        let Some(abs_axes) = device.supported_absolute_axes() else {
-            continue;
-        };
-        if supported_hotkey_abs_codes()
-            .into_iter()
-            .any(|axis| abs_axes.contains(axis))
-        {
+        let supports_hotkeys = device.supported_absolute_axes().is_some_and(|axes| {
+            supported_hotkey_abs_codes()
+                .into_iter()
+                .any(|axis| axes.contains(axis))
+        });
+        let supports_keys = device
+            .supported_keys()
+            .is_some_and(|keys| keys.iter().next().is_some());
+        if supports_hotkeys || supports_keys {
             devices.push(path);
         }
     }
@@ -978,16 +1156,20 @@ fn cycle_backlight() -> Result<(), String> {
     crate::commands::backlight::set_backlight_daemon_first(next)
 }
 
-fn step_brightness(direction: &str) -> Result<(), String> {
-    if let Ok(output) = Command::new("brightnessctl")
-        .args(["set", if direction == "up" { "5%+" } else { "5%-" }])
-        .output()
+/// The UI is a single-instance application: invoking its installed launcher
+/// focuses the existing tray-minimized window, or starts it if needed.
+fn open_control_window() {
+    let mut command = Command::new("/usr/bin/zenbook-duo-control");
+    if env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime_dir| Path::new(&runtime_dir).join("wayland-0").exists())
+        .unwrap_or(false)
     {
-        if output.status.success() {
-            return Ok(());
-        }
+        command.env("WAYLAND_DISPLAY", "wayland-0");
     }
+    let _ = command.spawn();
+}
 
+fn step_brightness(direction: &str) -> Result<(), String> {
     let bl = Path::new("/sys/class/backlight/intel_backlight");
     if !bl.exists() {
         return Err("no intel_backlight device found".into());
@@ -1001,46 +1183,17 @@ fn step_brightness(direction: &str) -> Result<(), String> {
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
         .unwrap_or(0);
-    let step = (max / 20).max(1);
-    let next = if direction == "up" {
-        (current + step).min(max)
+    let current_percent = brightness_percent(current.max(0) as u32, max.max(0) as u32);
+    let next_percent = if direction == "up" {
+        current_percent.saturating_add(5).min(100)
     } else {
-        (current - step).max(0)
+        current_percent.saturating_sub(5)
     };
 
-    if fs::write(bl.join("brightness"), next.to_string()).is_ok() {
-        return Ok(());
-    }
-
-    let output = Command::new("sudo")
-        .args([
-            "/usr/bin/tee",
-            "/sys/class/backlight/intel_backlight/brightness",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run sudo tee for brightness step: {e}"))?;
-
-    let mut child = output;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(next.to_string().as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|e| format!("Failed to write brightness value: {e}"))?;
-    }
-    let result = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed waiting for brightness helper: {e}"))?;
-    if result.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "brightness step failed: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
-        ))
-    }
+    // Route hotkeys through the daemon. This updates the persisted percentage
+    // and writes every active internal panel, instead of leaving a stale
+    // value that would be restored after the next keyboard dock transition.
+    set_display_brightness(next_percent)
 }
 
 async fn watch_rotation() -> Result<(), String> {

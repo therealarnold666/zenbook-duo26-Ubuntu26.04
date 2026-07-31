@@ -22,10 +22,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            present_main_window(app);
         }))
         .plugin(tauri_plugin_shell::init())
         .manage(event_buffer.clone())
@@ -51,6 +48,7 @@ pub fn run() {
             commands::status::get_status,
             commands::battery::get_battery_status,
             commands::battery::set_charge_limit,
+            commands::power::apply_performance_mode,
             commands::backlight::get_backlight,
             commands::backlight::set_backlight,
             commands::display::get_display_layout,
@@ -151,10 +149,7 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
             let id = event.id().as_ref();
             match id {
                 "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+                    present_main_window(app);
                 }
                 "quit" => {
                     app.exit(0);
@@ -198,13 +193,30 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                present_main_window(app);
             }
         })
         .build(app)?;
 
     Ok(())
+}
+
+/// Presents the single Control window above the current application. Wayland
+/// can otherwise ignore a focus request that originates from a background
+/// keyboard-helper process, so briefly raising the window makes F12 reliable
+/// without leaving the application permanently on top.
+fn present_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focus();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = window.set_always_on_top(false);
+    });
 }

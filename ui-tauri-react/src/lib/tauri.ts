@@ -16,6 +16,7 @@ import type {
   UsbMediaRemapStatus,
   TouchscreenDevice,
   BatteryStatus,
+  PerformanceMode,
 } from "@/types/duo";
 
 // Status
@@ -26,6 +27,8 @@ export const getBatteryStatus = () =>
   invoke<BatteryStatus>("get_battery_status");
 export const setChargeLimit = (limit: number) =>
   invoke<BatteryStatus>("set_charge_limit", { limit });
+export const applyPerformanceMode = (mode: PerformanceMode) =>
+  invoke<void>("apply_performance_mode", { mode });
 
 // Backlight
 export const getBacklight = () => invoke<number>("get_backlight");
