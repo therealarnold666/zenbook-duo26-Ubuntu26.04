@@ -4,6 +4,19 @@ export type RefreshPolicy = "fixed" | "dynamic";
 export type EventCategory = "USB" | "DISPLAY" | "KEYBOARD" | "NETWORK" | "ROTATION" | "BLUETOOTH" | "SERVICE";
 export type EventSeverity = "info" | "warning" | "error";
 export type ThemePreference = "system" | "light" | "dark";
+export type PerformanceMode = "quiet" | "balanced" | "performance";
+
+export interface PowerLimits {
+  pl1Watts: number;
+  pl2Watts: number;
+  pl3Watts: number;
+}
+
+export interface PerformanceProfiles {
+  quiet: PowerLimits;
+  balanced: PowerLimits;
+  performance: PowerLimits;
+}
 
 export interface DuoStatus {
   keyboardAttached: boolean;
@@ -62,6 +75,10 @@ export interface DuoSettings {
   defaultScale: number;
   autoDualScreen: boolean;
   autoRotate: boolean;
+  keyboardBacklightPowerSave: boolean;
+  autoQuietOnBattery: boolean;
+  activePerformanceMode: PerformanceMode;
+  performanceProfiles: PerformanceProfiles;
   syncBrightness: boolean;
   theme: ThemePreference;
   usbMediaRemapEnabled: boolean;

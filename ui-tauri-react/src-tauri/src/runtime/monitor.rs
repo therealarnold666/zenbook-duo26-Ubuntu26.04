@@ -4,7 +4,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::sync::RwLock;
 
-use crate::models::{ConnectionType, EventCategory, HardwareEvent};
+use crate::models::{ConnectionType, EventCategory, HardwareEvent, PerformanceMode};
 use crate::runtime::logger;
 use crate::runtime::policy::PolicyAction;
 use crate::runtime::state::RuntimeState;
@@ -68,8 +68,138 @@ pub fn start(state: Arc<RwLock<RuntimeState>>) {
             }
 
             reconcile_usb_media_remap(state.clone()).await;
+            reconcile_auto_quiet_on_battery(state.clone()).await;
         }
     });
+}
+
+async fn reconcile_auto_quiet_on_battery(state: Arc<RwLock<RuntimeState>>) {
+    let action = {
+        let guard = state.read().await;
+        auto_quiet_action(&guard, crate::hardware::battery::is_discharging())
+    };
+
+    match action {
+        AutoQuietAction::None => {}
+        AutoQuietAction::ClearRestoreMode => {
+            let mut guard = state.write().await;
+            guard.battery_saver_restore_mode = None;
+            guard.touch();
+            if let Err(err) = guard.save() {
+                log::warn!("failed to clear battery saver restore mode: {err}");
+            }
+        }
+        AutoQuietAction::EnterQuiet {
+            restore_mode,
+            limits,
+        } => match crate::hardware::power::apply_performance_mode(&PerformanceMode::Quiet, &limits)
+        {
+            Ok(()) => {
+                let mut guard = state.write().await;
+                guard.battery_saver_restore_mode = Some(restore_mode);
+                guard.settings.active_performance_mode = PerformanceMode::Quiet;
+                record_auto_performance_change(
+                    &mut guard,
+                    "Switched performance mode to Quiet on battery power",
+                );
+                let _ = logger::append_line(
+                    "rust-daemon: auto battery saver switched performance mode -> quiet",
+                );
+            }
+            Err(err) => log_auto_performance_error("switch to Quiet on battery power", err),
+        },
+        AutoQuietAction::Restore { mode, limits } => {
+            match crate::hardware::power::apply_performance_mode(&mode, &limits) {
+                Ok(()) => {
+                    let mut guard = state.write().await;
+                    guard.battery_saver_restore_mode = None;
+                    guard.settings.active_performance_mode = mode.clone();
+                    record_auto_performance_change(
+                        &mut guard,
+                        &format!(
+                            "Restored {} performance mode on AC power",
+                            mode_label(&mode)
+                        ),
+                    );
+                    let _ = logger::append_line(format!(
+                        "rust-daemon: auto battery saver restored performance mode -> {}",
+                        mode_label(&mode)
+                    ));
+                }
+                Err(err) => log_auto_performance_error("restore performance mode on AC power", err),
+            }
+        }
+    }
+}
+
+enum AutoQuietAction {
+    None,
+    ClearRestoreMode,
+    EnterQuiet {
+        restore_mode: PerformanceMode,
+        limits: crate::models::PowerLimits,
+    },
+    Restore {
+        mode: PerformanceMode,
+        limits: crate::models::PowerLimits,
+    },
+}
+
+fn auto_quiet_action(state: &RuntimeState, on_battery_power: bool) -> AutoQuietAction {
+    if !state.settings.auto_quiet_on_battery {
+        return state
+            .battery_saver_restore_mode
+            .is_some()
+            .then_some(AutoQuietAction::ClearRestoreMode)
+            .unwrap_or(AutoQuietAction::None);
+    }
+
+    if on_battery_power {
+        return match (
+            &state.battery_saver_restore_mode,
+            &state.settings.active_performance_mode,
+        ) {
+            (None, mode) if *mode != PerformanceMode::Quiet => AutoQuietAction::EnterQuiet {
+                restore_mode: mode.clone(),
+                limits: state.settings.performance_profiles.quiet.clone(),
+            },
+            _ => AutoQuietAction::None,
+        };
+    }
+
+    state
+        .battery_saver_restore_mode
+        .as_ref()
+        .map(|mode| AutoQuietAction::Restore {
+            mode: mode.clone(),
+            limits: state.settings.performance_profiles.for_mode(mode).clone(),
+        })
+        .unwrap_or(AutoQuietAction::None)
+}
+
+fn record_auto_performance_change(state: &mut RuntimeState, message: &str) {
+    state.recent_events.push(HardwareEvent::info(
+        EventCategory::Service,
+        message,
+        "rust-daemon",
+    ));
+    state.touch();
+    if let Err(err) = state.save() {
+        log::warn!("failed to persist automatic performance mode: {err}");
+    }
+}
+
+fn log_auto_performance_error(action: &str, err: String) {
+    log::warn!("failed to {action}: {err}");
+    let _ = logger::append_line(format!("rust-daemon: failed to {action}: {err}"));
+}
+
+fn mode_label(mode: &PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Quiet => "Quiet",
+        PerformanceMode::Balanced => "Balanced",
+        PerformanceMode::Performance => "Performance",
+    }
 }
 
 async fn reconcile_usb_media_remap(state: Arc<RwLock<RuntimeState>>) {
@@ -489,7 +619,36 @@ fn orientation_label(orientation: &crate::models::Orientation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::should_skip_detached_secondary_recovery;
+    use super::{auto_quiet_action, should_skip_detached_secondary_recovery, AutoQuietAction};
+    use crate::models::{PerformanceMode, PowerLimits};
+    use crate::runtime::state::RuntimeState;
+
+    #[test]
+    fn battery_saver_restores_the_pre_battery_mode_on_ac() {
+        let mut state = RuntimeState::default();
+        state.settings.auto_quiet_on_battery = true;
+        state.settings.active_performance_mode = PerformanceMode::Performance;
+
+        let enter = auto_quiet_action(&state, true);
+        assert!(matches!(
+            enter,
+            AutoQuietAction::EnterQuiet {
+                restore_mode: PerformanceMode::Performance,
+                ..
+            }
+        ));
+
+        state.settings.active_performance_mode = PerformanceMode::Quiet;
+        state.battery_saver_restore_mode = Some(PerformanceMode::Performance);
+        let restore = auto_quiet_action(&state, false);
+        assert!(matches!(
+            restore,
+            AutoQuietAction::Restore {
+                mode: PerformanceMode::Performance,
+                limits: PowerLimits { pl1_watts: 45, .. },
+            }
+        ));
+    }
 
     #[test]
     fn detached_recovery_is_allowed_after_runtime_disabled_the_panel() {

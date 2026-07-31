@@ -80,6 +80,22 @@ function run_user_systemctl() {
         systemctl --user "$@"
 }
 
+# Persist a GNOME setting for the desktop user even when this installer is
+# invoked through sudo.  Touchscreen-to-output assignment is per user, not a
+# system-wide udev property.
+function run_user_gsettings() {
+    if [ "${TARGET_USER}" = "${USER}" ] && [ "${EUID}" != "0" ]; then
+        gsettings "$@"
+        return
+    fi
+
+    sudo -u "${TARGET_USER}" \
+        HOME="${TARGET_HOME}" \
+        XDG_RUNTIME_DIR="/run/user/${TARGET_UID}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus" \
+        gsettings "$@"
+}
+
 function duo_prompt() {
     local prompt="${1}"
     local reply_var="${2}"
@@ -195,6 +211,28 @@ sudo rm -f /etc/udev/hwdb.d/90-zenbook-duo-keyboard.hwdb
 # Rebuild the hardware database and trigger udev to apply the new rules immediately
 sudo systemd-hwdb update
 sudo udevadm trigger
+
+# eDP-1 is physically installed upside down.  libinput must invert the main
+# RAYD touchscreen before GNOME maps it onto the 180-degree rotated output.
+sudo install -D -m 0644 "$(dirname "$0")/system/udev/62-asus-ux8407aa-touchscreen.rules" \
+    /etc/udev/rules.d/62-asus-ux8407aa-touchscreen.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=input
+
+# The two internal RAYD touch controllers do not carry an output association
+# that GNOME can infer.  Without these per-device assignments, GNOME sends both
+# devices to the primary logical monitor and does not apply eDP-1's required
+# 180-degree output transform to its touch input.
+if command -v gsettings >/dev/null 2>&1; then
+    run_user_gsettings set \
+        'org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/2386:8c05/' \
+        output "['BOE', 'NB140B9M-T01', '0x00000000']"
+    run_user_gsettings set \
+        'org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/2386:8c06/' \
+        output "['BOE', 'NB140B9M-T02', '0x00000000']"
+else
+    echo "WARNING: gsettings is unavailable; touchscreen output mappings were not installed."
+fi
 
 # ============================================================================
 # UI DEFAULTS (settings.json)
