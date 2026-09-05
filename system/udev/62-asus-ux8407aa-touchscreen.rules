@@ -1,7 +1,8 @@
 # The UX8407AA main panel is physically mounted upside down. Its RAYD0001
-# touchscreen reports the panel's native coordinates, while GNOME rotates the
-# eDP-1 output by 180 degrees. Apply the inverse transform at libinput so a
-# touch at a physical corner reaches the same visible corner.
+# touch and stylus nodes report the panel's native coordinates, while GNOME
+# rotates the eDP-1 output by 180 degrees. Apply the inverse transform at
+# libinput so a touch or pen point reaches the same visible corner.
 #
 # Matrix form: x' = -x + 1, y' = -y + 1
 ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="2386", ATTRS{id/product}=="8c05", ENV{ID_INPUT_TOUCHSCREEN}=="1", ENV{LIBINPUT_CALIBRATION_MATRIX}="-1 0 1 0 -1 1"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="2386", ATTRS{id/product}=="8c05", ENV{ID_INPUT_TABLET}=="1", ENV{LIBINPUT_CALIBRATION_MATRIX}="-1 0 1 0 -1 1"

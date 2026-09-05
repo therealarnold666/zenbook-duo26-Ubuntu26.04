@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+; Keep the hardware clock in UTC so Windows and Linux agree after dual boot.
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\TimeZoneInformation]
+"RealTimeIsUniversal"=dword:00000001

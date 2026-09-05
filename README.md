@@ -86,9 +86,27 @@ systemctl --user restart zenbook-duo-session-agent.service
 
 The main panel is physically mounted 180 degrees from its usable display
 orientation. The GNOME setup script installs a libinput calibration rule for
-the primary RAYD touchscreen, and persists each internal touchscreen's GNOME
-output assignment. After a manual rule installation, reboot once (or rebind
-the touchscreen device) before testing it.
+the primary RAYD touchscreen and stylus, and persists the GNOME output
+assignments for both internal touch/tablet devices. This also aligns an ASUS
+Pen 2.0 with the visible main-panel coordinates while keeping lower-panel pen
+input on the lower panel. After a manual rule installation, reboot once (or
+rebind the RAYD HID device) before testing it.
+
+### Windows/Linux dual-boot clock
+
+Linux keeps the hardware clock in UTC. To prevent Windows from shifting the
+clock by the local UTC offset after switching operating systems, import
+[`system/windows/zenbook-duo-utc-hardware-clock.reg`](system/windows/zenbook-duo-utc-hardware-clock.reg)
+from an administrator account in Windows and reboot. On Linux, verify the
+matching configuration with `timedatectl`; it should report
+`RTC in local TZ: no`.
+
+To undo the Windows setting, run the following command from an elevated
+Command Prompt and reboot:
+
+```cmd
+reg delete "HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation" /v RealTimeIsUniversal /f
+```
 
 Rotate the device left or right while keeping the displays facing you; a
 face-up or face-down position is intentionally ignored because it has no
