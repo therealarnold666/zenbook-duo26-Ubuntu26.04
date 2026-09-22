@@ -10,6 +10,8 @@ import Profiles from "@/pages/Profiles";
 import EventMonitor from "@/pages/EventMonitor";
 import Diagnostics from "@/pages/Diagnostics";
 import Setup from "@/pages/Setup";
+import Performance from "@/pages/Performance";
+import PerformanceStrip from "@/components/PerformanceStrip";
 
 export type Page =
   | "status"
@@ -19,7 +21,8 @@ export type Page =
   | "display"
   | "profiles"
   | "events"
-  | "diagnostics";
+  | "diagnostics"
+  | "performance";
 
 const pageComponents: Record<Page, React.ComponentType> = {
   status: Status,
@@ -30,6 +33,7 @@ const pageComponents: Record<Page, React.ComponentType> = {
   profiles: Profiles,
   events: EventMonitor,
   diagnostics: Diagnostics,
+  performance: Performance,
 };
 
 export default function App() {
@@ -50,6 +54,7 @@ export default function App() {
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Subtle top border accent */}
         <div className="h-px w-full bg-gradient-to-r from-transparent via-primary/20 to-transparent" />
+        <PerformanceStrip />
         <main className="flex-1 overflow-y-auto px-8 py-7" key={currentPage}>
           <div className="animate-page-enter mx-auto max-w-4xl">
             <PageComponent />

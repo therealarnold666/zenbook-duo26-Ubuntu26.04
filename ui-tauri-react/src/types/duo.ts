@@ -5,6 +5,23 @@ export type EventCategory = "USB" | "DISPLAY" | "KEYBOARD" | "NETWORK" | "ROTATI
 export type EventSeverity = "info" | "warning" | "error";
 export type ThemePreference = "system" | "light" | "dark";
 export type PerformanceMode = "quiet" | "balanced" | "performance";
+export type TrayPerformanceMetric =
+  | "cpuUsage"
+  | "cpuTemperature"
+  | "gpuUsage"
+  | "gpuTemperature"
+  | "memoryUsage"
+  | "gpuMemoryUsage";
+
+export interface TrayPerformanceItem {
+  metric: TrayPerformanceMetric;
+  enabled: boolean;
+}
+
+export interface TrayPerformanceSettings {
+  enabled: boolean;
+  items: TrayPerformanceItem[];
+}
 
 export interface PowerLimits {
   pl1Watts: number;
@@ -16,6 +33,19 @@ export interface PerformanceProfiles {
   quiet: PowerLimits;
   balanced: PowerLimits;
   performance: PowerLimits;
+}
+
+export interface PerformanceMetrics {
+  sampledAt: number;
+  cpuTemperatureC: number | null;
+  cpuUsagePercent: number | null;
+  gpuTemperatureC: number | null;
+  gpuUsagePercent: number | null;
+  gpuMemoryUsedBytes: number;
+  gpuMemoryTotalBytes: number;
+  gpuMemoryIsShared: boolean;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
 }
 
 export interface DuoStatus {

@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod display;
 pub mod events;
 pub mod logs;
+pub mod performance;
 pub mod power;
 pub mod profiles;
 pub mod service;

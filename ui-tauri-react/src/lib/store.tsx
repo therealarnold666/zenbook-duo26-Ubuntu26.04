@@ -11,6 +11,7 @@ import type {
   DuoSettings,
   Profile,
   HardwareEvent,
+  PerformanceMetrics,
 } from "@/types/duo";
 import * as api from "@/lib/tauri";
 
@@ -20,6 +21,8 @@ export interface AppState {
   profiles: Profile[];
   events: HardwareEvent[];
   logs: string[];
+  performance: PerformanceMetrics | null;
+  performanceHistory: PerformanceMetrics[];
   loading: boolean;
 }
 
@@ -29,6 +32,7 @@ type Action =
   | { type: "SET_PROFILES"; payload: Profile[] }
   | { type: "SET_EVENTS"; payload: HardwareEvent[] }
   | { type: "SET_LOGS"; payload: string[] }
+  | { type: "SET_PERFORMANCE"; payload: PerformanceMetrics }
   | { type: "SET_LOADING"; payload: boolean };
 
 const defaultStatus: DuoStatus = {
@@ -71,6 +75,8 @@ const initialState: AppState = {
   profiles: [],
   events: [],
   logs: [],
+  performance: null,
+  performanceHistory: [],
   loading: true,
 };
 
@@ -86,6 +92,12 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, events: action.payload };
     case "SET_LOGS":
       return { ...state, logs: action.payload };
+    case "SET_PERFORMANCE":
+      return {
+        ...state,
+        performance: action.payload,
+        performanceHistory: [...state.performanceHistory.slice(-59), action.payload],
+      };
     case "SET_LOADING":
       return { ...state, loading: action.payload };
   }
@@ -168,6 +180,15 @@ export async function refreshEvents(dispatch: Dispatch<Action>) {
   }
 }
 
+export async function refreshPerformance(dispatch: Dispatch<Action>) {
+  try {
+    const performance = await api.getPerformanceMetrics();
+    dispatch({ type: "SET_PERFORMANCE", payload: performance });
+  } catch (e) {
+    console.error("Failed to read performance metrics:", e);
+  }
+}
+
 export function useStoreInit() {
   const dispatch = useDispatch();
 
@@ -182,6 +203,7 @@ export function useStoreInit() {
         refreshSettings(dispatch),
         refreshProfiles(dispatch),
         refreshLogs(dispatch),
+        refreshPerformance(dispatch),
       ]);
 
       dispatch({ type: "SET_LOADING", payload: false });
@@ -189,6 +211,12 @@ export function useStoreInit() {
       unlisteners.push(api.onStatusChanged(() => refreshStatus(dispatch)));
       unlisteners.push(api.onLogUpdated(() => refreshLogs(dispatch)));
       unlisteners.push(api.onHardwareEvent(() => refreshEvents(dispatch)));
+
+      const performanceTimer = window.setInterval(
+        () => void refreshPerformance(dispatch),
+        1000
+      );
+      unlisteners.push(Promise.resolve(() => window.clearInterval(performanceTimer)));
     }
 
     init();
