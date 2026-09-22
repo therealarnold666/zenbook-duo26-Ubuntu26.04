@@ -12,10 +12,12 @@ import {
   IconBolt,
   IconBug,
   IconDeviceDesktop,
+  IconChartHistogram,
 } from "@tabler/icons-react";
 
 const navItems: { id: Page; label: string; icon: React.ComponentType<{ className?: string; stroke?: number }> }[] = [
   { id: "status", label: "Status", icon: IconCircleDot },
+  { id: "performance", label: "Performance", icon: IconChartHistogram },
   { id: "display", label: "Displays", icon: IconDeviceDesktop },
   { id: "controls", label: "Controls", icon: IconAdjustments },
   { id: "profiles", label: "Profiles", icon: IconUsers },

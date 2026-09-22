@@ -16,6 +16,9 @@ import type {
   UsbMediaRemapStatus,
   TouchscreenDevice,
   BatteryStatus,
+  PerformanceMode,
+  PerformanceMetrics,
+  TrayPerformanceSettings,
 } from "@/types/duo";
 
 // Status
@@ -26,6 +29,14 @@ export const getBatteryStatus = () =>
   invoke<BatteryStatus>("get_battery_status");
 export const setChargeLimit = (limit: number) =>
   invoke<BatteryStatus>("set_charge_limit", { limit });
+export const applyPerformanceMode = (mode: PerformanceMode) =>
+  invoke<void>("apply_performance_mode", { mode });
+export const getPerformanceMetrics = () =>
+  invoke<PerformanceMetrics>("get_performance_metrics");
+export const loadTrayPerformanceSettings = () =>
+  invoke<TrayPerformanceSettings>("load_tray_performance_settings");
+export const saveTrayPerformanceSettings = (settings: TrayPerformanceSettings) =>
+  invoke<void>("save_tray_performance_settings", { settings });
 
 // Backlight
 export const getBacklight = () => invoke<number>("get_backlight");

@@ -1,5 +1,21 @@
 # Zenbook Duo Control UI
 
+## Performance monitoring
+
+The control panel samples hardware telemetry once per second and shows a compact
+summary in the upper-right corner of the window. The Performance page adds a
+60-second utilization chart and detailed CPU, GPU, graphics-memory, and system
+memory readings.
+
+- CPU load comes from `/proc/stat`; package temperature prefers `coretemp` or
+  `k10temp` and falls back to the matching thermal zone.
+- GPU load and resident graphics memory come from DRM client accounting in
+  `/proc/*/fdinfo`, including Intel's `xe` cycle counters.
+- Dedicated VRAM is used when the DRM driver exposes it. Integrated GPUs are
+  labelled as shared memory and use system memory as their capacity.
+- GPU temperature is shown only when the kernel exposes a GPU-specific hwmon or
+  thermal sensor. Unsupported sensors display `--` instead of a guessed value.
+
 ## Build commands
 
 - `npm run build`: full Tauri release build with configured bundles.

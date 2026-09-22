@@ -380,6 +380,25 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                 }
                 Err(message) => DaemonResponse::Error { message },
             },
+            DaemonRequest::SetDisplayBrightness { percent } => {
+                match hardware::sysfs::set_display_brightness_percent(percent) {
+                    Ok(()) => {
+                        let mut guard = state.write().await;
+                        guard.settings.last_display_brightness_percent = Some(percent);
+                        guard.status.display_brightness =
+                            hardware::sysfs::read_display_brightness();
+                        match commands::settings::save_settings_local(guard.settings.clone()) {
+                            Ok(()) => {
+                                guard.touch();
+                                persist_state(&guard);
+                                DaemonResponse::Ack
+                            }
+                            Err(message) => DaemonResponse::Error { message },
+                        }
+                    }
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
             DaemonRequest::SetChargeLimit { limit } => {
                 match hardware::battery::set_charge_limit(limit) {
                     Ok(status) => {
@@ -399,6 +418,25 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<RuntimeState>>) -> 
                                     "The {limit}% limit is active, but saving it failed: {message}"
                                 ),
                             },
+                        }
+                    }
+                    Err(message) => DaemonResponse::Error { message },
+                }
+            }
+            DaemonRequest::ApplyPerformanceMode { mode } => {
+                let mut guard = state.write().await;
+                let limits = guard.settings.performance_profiles.for_mode(&mode).clone();
+                match hardware::power::apply_performance_mode(&mode, &limits) {
+                    Ok(()) => {
+                        guard.settings.active_performance_mode = mode.clone();
+                        guard.battery_saver_restore_mode = None;
+                        match commands::settings::save_settings_local(guard.settings.clone()) {
+                            Ok(()) => {
+                                guard.touch();
+                                persist_state(&guard);
+                                DaemonResponse::Ack
+                            }
+                            Err(message) => DaemonResponse::Error { message },
                         }
                     }
                     Err(message) => DaemonResponse::Error { message },

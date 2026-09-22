@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use crate::ipc::protocol::SessionBackend;
-use crate::models::{DuoSettings, DuoStatus, HardwareEvent};
+use crate::models::{DuoSettings, DuoStatus, HardwareEvent, PerformanceMode};
 use crate::runtime::paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +14,10 @@ pub struct RuntimeState {
     pub session_agent: SessionAgentState,
     #[serde(default)]
     pub usb_media_remap_reconcile: UsbMediaRemapReconcileState,
+    /// The user-selected performance mode to restore after an automatic
+    /// battery-saver Quiet override ends.
+    #[serde(default)]
+    pub battery_saver_restore_mode: Option<PerformanceMode>,
     /// True only when this runtime successfully turned off an already-enabled eDP-2
     /// while the keyboard was attached. It distinguishes an intentional dock-mode
     /// change from xe having already disabled the connector after a link failure.
@@ -36,6 +40,7 @@ impl Default for RuntimeState {
             settings: DuoSettings::default(),
             session_agent: SessionAgentState::default(),
             usb_media_remap_reconcile: UsbMediaRemapReconcileState::default(),
+            battery_saver_restore_mode: None,
             secondary_panel_disabled_by_runtime: false,
             secondary_panel_disabled_by_runtime_boot_id: None,
             last_runtime_notification: None,

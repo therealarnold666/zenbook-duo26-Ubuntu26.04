@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::ipc::protocol::{DaemonRequest, DaemonResponse};
 use crate::runtime::paths;
 
 pub fn run_from_env() -> Result<(), String> {
@@ -238,6 +239,12 @@ fn handle_event(
             }
             return Ok(());
         }
+        Key::KEY_F12 => {
+            if value == 1 {
+                open_control_window(args.user.as_deref());
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -432,6 +439,38 @@ fn open_emoji_picker(user: Option<&str>) {
     let _ = cmd.arg("gnome-characters").spawn();
 }
 
+/// Starts the control application for the desktop user. The app's
+/// single-instance handler focuses its existing window, so this also works
+/// when it is already running minimized in the tray.
+fn open_control_window(user: Option<&str>) {
+    let user = match user {
+        Some(user) => user,
+        None => return,
+    };
+    let uid = match nix::unistd::User::from_name(user) {
+        Ok(Some(user)) => user.uid.as_raw(),
+        _ => return,
+    };
+    let runtime_dir = format!("/run/user/{uid}");
+    let bus_address = format!("unix:path={runtime_dir}/bus");
+
+    let mut cmd = if nix::unistd::Uid::current().is_root() {
+        let mut cmd = Command::new("runuser");
+        cmd.arg("-u").arg(user).arg("--").arg("env");
+        cmd
+    } else {
+        Command::new("env")
+    };
+
+    cmd.arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+        .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus_address}"));
+    if Path::new(&format!("{runtime_dir}/wayland-0")).exists() {
+        cmd.arg("WAYLAND_DISPLAY=wayland-0");
+    }
+
+    let _ = cmd.arg("/usr/bin/zenbook-duo-control").spawn();
+}
+
 fn current_time_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -447,19 +486,29 @@ fn step_brightness(direction: &str) -> Result<(), String> {
 
     let primary_max = read_backlight_value(&primary.join("max_brightness"))?;
     let current = read_backlight_value(&primary.join("brightness"))?;
-    let next = next_brightness_value(current, primary_max, direction);
+    let current_percent = brightness_percent(current, primary_max);
+    let next_percent = if direction == "up" {
+        current_percent.saturating_add(5).min(100)
+    } else {
+        current_percent.saturating_sub(5)
+    };
 
-    fs::write(primary.join("brightness"), next.to_string())
-        .map_err(|e| format!("Failed to write primary brightness: {e}"))?;
-
-    if let Some(secondary) = crate::hardware::sysfs::secondary_backlight_dir() {
-        let secondary_max = read_backlight_value(&secondary.join("max_brightness"))?;
-        let mirrored = next.min(secondary_max);
-        fs::write(secondary.join("brightness"), mirrored.to_string())
-            .map_err(|e| format!("Failed to write secondary brightness: {e}"))?;
+    match crate::runtime::client::request(DaemonRequest::SetDisplayBrightness {
+        percent: next_percent,
+    })? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!(
+            "Unexpected daemon response while setting display brightness: {other:?}"
+        )),
     }
+}
 
-    Ok(())
+fn brightness_percent(level: i32, max: i32) -> u8 {
+    if max <= 0 {
+        return 0;
+    }
+    ((level.max(0).saturating_mul(100) + max / 2) / max).min(100) as u8
 }
 
 fn read_backlight_value(path: &Path) -> Result<i32, String> {
@@ -470,6 +519,7 @@ fn read_backlight_value(path: &Path) -> Result<i32, String> {
         .map_err(|e| format!("Invalid brightness value in {}: {e}", path.display()))
 }
 
+#[cfg(test)]
 fn next_brightness_value(current: i32, max: i32, direction: &str) -> i32 {
     let step = (max / 20).max(1);
     if direction == "up" {

@@ -141,6 +141,7 @@ mod tests {
             settings: DuoSettings::default(),
             session_agent: Default::default(),
             usb_media_remap_reconcile: Default::default(),
+            battery_saver_restore_mode: None,
             secondary_panel_disabled_by_runtime: false,
             secondary_panel_disabled_by_runtime_boot_id: None,
             last_runtime_notification: None,

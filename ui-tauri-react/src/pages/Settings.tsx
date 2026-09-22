@@ -1,7 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useStore, useDispatch, refreshSettings } from "@/lib/store";
-import { saveSettings } from "@/lib/tauri";
-import type { DuoSettings, ThemePreference } from "@/types/duo";
+import {
+  loadTrayPerformanceSettings,
+  saveSettings,
+  saveTrayPerformanceSettings,
+} from "@/lib/tauri";
+import type {
+  DuoSettings,
+  ThemePreference,
+  TrayPerformanceMetric,
+  TrayPerformanceSettings,
+} from "@/types/duo";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -17,7 +26,36 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { IconDeviceFloppy, IconKeyboard, IconPlayerPause, IconPlayerPlay } from "@tabler/icons-react";
+import {
+  IconChartHistogram,
+  IconChevronDown,
+  IconChevronUp,
+  IconDeviceFloppy,
+  IconKeyboard,
+  IconPlayerPause,
+  IconPlayerPlay,
+} from "@tabler/icons-react";
+
+const trayMetricLabels: Record<TrayPerformanceMetric, string> = {
+  cpuUsage: "CPU usage",
+  cpuTemperature: "CPU temperature",
+  gpuUsage: "GPU usage",
+  gpuTemperature: "GPU temperature",
+  memoryUsage: "Memory usage",
+  gpuMemoryUsage: "Graphics memory usage",
+};
+
+const defaultTrayPerformanceSettings: TrayPerformanceSettings = {
+  enabled: true,
+  items: [
+    { metric: "cpuUsage", enabled: true },
+    { metric: "cpuTemperature", enabled: true },
+    { metric: "gpuUsage", enabled: true },
+    { metric: "gpuTemperature", enabled: true },
+    { metric: "memoryUsage", enabled: true },
+    { metric: "gpuMemoryUsage", enabled: true },
+  ],
+};
 
 export default function Settings() {
   const store = useStore();
@@ -27,6 +65,21 @@ export default function Settings() {
   const [localSettings, setLocalSettings] = useState<DuoSettings>({
     ...store.settings,
   });
+  const [traySettings, setTraySettings] = useState<TrayPerformanceSettings>(
+    defaultTrayPerformanceSettings
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    loadTrayPerformanceSettings()
+      .then((settings) => {
+        if (!cancelled) setTraySettings(settings);
+      })
+      .catch((error) => console.error("Failed to load tray performance settings:", error));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const {
     isUsb,
     remapBusy,
@@ -44,10 +97,33 @@ export default function Settings() {
     setLocalSettings((prev) => ({ ...prev, [key]: value }));
   };
 
+  const setTrayMetricEnabled = (metric: TrayPerformanceMetric, enabled: boolean) => {
+    setTraySettings((prev) => ({
+      ...prev,
+      items: prev.items.map((item) =>
+        item.metric === metric ? { ...item, enabled } : item
+      ),
+    }));
+  };
+
+  const moveTrayMetric = (index: number, offset: -1 | 1) => {
+    setTraySettings((prev) => {
+      const destination = index + offset;
+      if (destination < 0 || destination >= prev.items.length) return prev;
+
+      const items = [...prev.items];
+      [items[index], items[destination]] = [items[destination], items[index]];
+      return { ...prev, items };
+    });
+  };
+
   const handleSave = async () => {
     setSaving(true);
     try {
-      await saveSettings(localSettings);
+      await Promise.all([
+        saveSettings(localSettings),
+        saveTrayPerformanceSettings(traySettings),
+      ]);
       await refreshSettings(dispatch);
 
       const themeMap: Record<ThemePreference, string> = {
@@ -147,6 +223,82 @@ export default function Settings() {
               </SelectContent>
             </Select>
           </SettingRow>
+        </div>
+      </div>
+
+      <div className="mt-5 glass-card animate-stagger-in stagger-2 rounded-xl p-5">
+        <div className="mb-5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <div className="flex size-7 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-600 dark:text-cyan-400">
+              <IconChartHistogram className="size-3.5" stroke={1.75} />
+            </div>
+            <div>
+              <h3 className="text-[13px] font-semibold text-foreground">Top Panel Performance</h3>
+              <p className="mt-0.5 text-[12px] text-muted-foreground">
+                Choose which live metrics appear beside the tray icon and in what order
+              </p>
+            </div>
+          </div>
+          <Button onClick={handleSave} disabled={saving} size="sm" className="gap-2">
+            <IconDeviceFloppy className="size-3.5" stroke={1.5} />
+            {saving ? "Saving..." : "Save"}
+          </Button>
+        </div>
+
+        <SettingRow
+          label="Show performance metrics"
+          description="Keep the tray icon while hiding or showing its live text"
+        >
+          <Switch
+            checked={traySettings.enabled}
+            onCheckedChange={(enabled) => setTraySettings((prev) => ({ ...prev, enabled }))}
+          />
+        </SettingRow>
+
+        <div className="my-4 h-px bg-border/50" />
+
+        <div className="space-y-1">
+          {traySettings.items.map((item, index) => (
+            <div
+              key={item.metric}
+              className="flex min-h-10 items-center gap-3 border-b border-border/40 px-1 py-1.5 last:border-b-0"
+            >
+              <span className="w-5 text-center font-mono text-[11px] tabular-nums text-muted-foreground/60">
+                {index + 1}
+              </span>
+              <Switch
+                checked={item.enabled}
+                onCheckedChange={(enabled) => setTrayMetricEnabled(item.metric, enabled)}
+                disabled={!traySettings.enabled}
+                aria-label={`Show ${trayMetricLabels[item.metric]}`}
+              />
+              <span className="flex-1 text-[13px] font-medium text-foreground">
+                {trayMetricLabels[item.metric]}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => moveTrayMetric(index, -1)}
+                disabled={index === 0}
+                title="Move up"
+                aria-label={`Move ${trayMetricLabels[item.metric]} up`}
+              >
+                <IconChevronUp className="size-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => moveTrayMetric(index, 1)}
+                disabled={index === traySettings.items.length - 1}
+                title="Move down"
+                aria-label={`Move ${trayMetricLabels[item.metric]} down`}
+              >
+                <IconChevronDown className="size-4" />
+              </Button>
+            </div>
+          ))}
         </div>
       </div>
 

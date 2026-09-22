@@ -22,12 +22,7 @@
         "decorations": true,
         "center": true
       }
-    ],
-    "trayIcon": {
-      "iconPath": "icons/32x32.png",
-      "iconAsTemplate": false,
-      "tooltip": "Zenbook Duo Control"
-    }
+    ]
   },
   "bundle": {
     "active": true,

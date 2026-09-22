@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
 import BacklightSlider from "@/components/BacklightSlider";
 import OrientationButtons from "@/components/OrientationButtons";
-import { restartService, listTouchscreens, setTouchscreenEnabled, loadSettings, saveSettings } from "@/lib/tauri";
-import type { TouchscreenDevice } from "@/types/duo";
+import { restartService, listTouchscreens, setTouchscreenEnabled, loadSettings, saveSettings, applyPerformanceMode } from "@/lib/tauri";
+import type { PerformanceMode, TouchscreenDevice } from "@/types/duo";
 import { Switch } from "@/components/ui/switch";
 import { refreshStatus, useDispatch, useStore } from "@/lib/store";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import {
   IconServer,
   IconCheck,
   IconHandFinger,
+  IconGauge,
 } from "@tabler/icons-react";
 
 export default function Controls() {
@@ -54,6 +55,56 @@ export default function Controls() {
     }
   };
 
+  const handleKeyboardPowerSaveToggle = async (keyboardBacklightPowerSave: boolean) => {
+    const settings = { ...store.settings, keyboardBacklightPowerSave };
+    try {
+      await saveSettings(settings);
+      dispatch({ type: "SET_SETTINGS", payload: settings });
+    } catch (err) {
+      console.error("Failed to save keyboard power-save setting:", err);
+    }
+  };
+
+  const handleAutoQuietOnBatteryToggle = async (autoQuietOnBattery: boolean) => {
+    const settings = { ...store.settings, autoQuietOnBattery };
+    try {
+      await saveSettings(settings);
+      dispatch({ type: "SET_SETTINGS", payload: settings });
+    } catch (err) {
+      console.error("Failed to save battery performance setting:", err);
+    }
+  };
+
+  const handlePerformanceMode = async (activePerformanceMode: PerformanceMode) => {
+    const settings = { ...store.settings, activePerformanceMode };
+    try {
+      await saveSettings(settings);
+      await applyPerformanceMode(activePerformanceMode);
+      dispatch({ type: "SET_SETTINGS", payload: settings });
+    } catch (err) {
+      console.error("Failed to apply performance mode:", err);
+    }
+  };
+
+  const handlePowerLimitChange = async (field: "pl1Watts" | "pl2Watts" | "pl3Watts", value: string) => {
+    const watts = Number.parseInt(value, 10);
+    if (!Number.isFinite(watts)) return;
+    const mode = store.settings.activePerformanceMode;
+    const settings = {
+      ...store.settings,
+      performanceProfiles: {
+        ...store.settings.performanceProfiles,
+        [mode]: { ...store.settings.performanceProfiles[mode], [field]: watts },
+      },
+    };
+    try {
+      await saveSettings(settings);
+      dispatch({ type: "SET_SETTINGS", payload: settings });
+    } catch (err) {
+      console.error("Failed to save power limits:", err);
+    }
+  };
+
   const handleRestart = async () => {
     setRestarting(true);
     setRestarted(false);
@@ -82,16 +133,67 @@ export default function Controls() {
 
       <div className="space-y-5">
         <div className="glass-card animate-stagger-in stagger-1 rounded-xl p-5">
-          <div className="mb-5 flex items-center gap-2.5">
-            <div className="flex size-7 items-center justify-center rounded-lg bg-amber-500/12 text-amber-500 dark:bg-amber-400/10 dark:text-amber-400">
-              <IconKeyboard className="size-3.5" stroke={1.75} />
+          <div className="mb-4 flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-7 items-center justify-center rounded-lg bg-rose-500/12 text-rose-500 dark:bg-rose-400/10 dark:text-rose-400">
+                <IconGauge className="size-3.5" stroke={1.75} />
+              </div>
+              <div>
+                <h3 className="text-[13px] font-semibold text-foreground">Performance Mode</h3>
+                <p className="text-[11px] text-muted-foreground">ASUS fan strategy and CPU power limits</p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-[13px] font-semibold text-foreground">
-                Keyboard Backlight
-              </h3>
-              <p className="text-[11px] text-muted-foreground">Adjust brightness level</p>
+            <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              Battery saver
+              <Switch
+                checked={store.settings.autoQuietOnBattery}
+                onCheckedChange={handleAutoQuietOnBatteryToggle}
+                aria-label="Automatically switch to Quiet mode on battery power"
+              />
+            </label>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {(["quiet", "balanced", "performance"] as PerformanceMode[]).map((mode) => {
+              const limits = store.settings.performanceProfiles[mode];
+              const active = store.settings.activePerformanceMode === mode;
+              return <button key={mode} onClick={() => handlePerformanceMode(mode)} className={cn("rounded-lg border px-2 py-2 text-left transition-colors", active ? "border-rose-500/50 bg-rose-500/10" : "border-border hover:bg-muted/50")}>
+                <span className="block text-xs font-semibold capitalize">{mode}</span>
+                <span className="mt-1 block font-mono text-[10px] text-muted-foreground">{limits.pl1Watts}/{limits.pl2Watts}/{limits.pl3Watts} W</span>
+              </button>;
+            })}
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {(["pl1Watts", "pl2Watts", "pl3Watts"] as const).map((field, index) => (
+              <label key={field} className="text-[10px] text-muted-foreground">
+                PL{index + 1} (W)
+                <input type="number" min={index === 0 ? 5 : 5} max={index === 0 ? 100 : index === 1 ? 150 : 200} value={store.settings.performanceProfiles[store.settings.activePerformanceMode][field]} onChange={(event) => handlePowerLimitChange(field, event.target.value)} className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs text-foreground" />
+              </label>
+            ))}
+          </div>
+          <p className="mt-3 text-[10px] text-muted-foreground">PL1 / PL2 / PL3. Edit values, then click the selected mode to apply. MMIO RAPL validates PL1 ≤ PL2 ≤ PL3.</p>
+        </div>
+
+        <div className="glass-card animate-stagger-in stagger-1 rounded-xl p-5">
+          <div className="mb-5 flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-7 items-center justify-center rounded-lg bg-amber-500/12 text-amber-500 dark:bg-amber-400/10 dark:text-amber-400">
+                <IconKeyboard className="size-3.5" stroke={1.75} />
+              </div>
+              <div>
+                <h3 className="text-[13px] font-semibold text-foreground">
+                  Keyboard Backlight
+                </h3>
+                <p className="text-[11px] text-muted-foreground">Adjust brightness level</p>
+              </div>
             </div>
+            <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              Power save
+              <Switch
+                checked={store.settings.keyboardBacklightPowerSave}
+                onCheckedChange={handleKeyboardPowerSaveToggle}
+                aria-label="Turn off detached keyboard backlight after inactivity"
+              />
+            </label>
           </div>
           <BacklightSlider />
         </div>

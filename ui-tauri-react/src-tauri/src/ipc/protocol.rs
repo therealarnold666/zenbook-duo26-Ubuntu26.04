@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::usb_media_remap::UsbMediaRemapStatus;
 use crate::models::{
     BatteryStatus, DisplayLayout, DuoSettings, DuoStatus, HardwareEvent, Orientation,
+    PerformanceMode,
 };
 
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -40,8 +41,14 @@ pub enum DaemonRequest {
     SetBacklight {
         level: u8,
     },
+    SetDisplayBrightness {
+        percent: u8,
+    },
     SetChargeLimit {
         limit: u8,
+    },
+    ApplyPerformanceMode {
+        mode: PerformanceMode,
     },
     SetOrientation {
         orientation: Orientation,

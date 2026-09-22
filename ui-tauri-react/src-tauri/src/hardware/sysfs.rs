@@ -72,6 +72,39 @@ pub fn secondary_backlight_brightness_path() -> Option<PathBuf> {
     secondary_backlight_dir().map(|path| path.join("brightness"))
 }
 
+/// Set every active internal panel to the same perceptual brightness.  Raw
+/// backlight maxima vary between panels, so callers must use a percentage.
+pub fn set_display_brightness_percent(percent: u8) -> Result<(), String> {
+    if percent > 100 {
+        return Err(format!(
+            "brightness percentage must be between 0 and 100, got {percent}"
+        ));
+    }
+
+    write_brightness_percent(Path::new("/sys/class/backlight/intel_backlight"), percent)?;
+
+    if secondary_panel_enabled() {
+        if let Some(secondary) = secondary_backlight_dir() {
+            write_brightness_percent(&secondary, percent)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_brightness_percent(backlight_dir: &Path, percent: u8) -> Result<(), String> {
+    let max_path = backlight_dir.join("max_brightness");
+    let brightness_path = backlight_dir.join("brightness");
+    let max = fs::read_to_string(&max_path)
+        .map_err(|e| format!("Failed to read {}: {e}", max_path.display()))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("Invalid max brightness in {}: {e}", max_path.display()))?;
+    let raw = max.saturating_mul(percent as u32) / 100;
+    fs::write(&brightness_path, raw.to_string())
+        .map_err(|e| format!("Failed to write {}: {e}", brightness_path.display()))
+}
+
 pub fn detect_connection_type() -> ConnectionType {
     let hidraw_dir = Path::new("/sys/class/hidraw");
     if !hidraw_dir.exists() {
