@@ -598,11 +598,22 @@ async fn verify_gnome_dock_mode(attached: bool) -> Result<(), String> {
 
 fn gnome_logical_snapshot_from_show(show_output: &str) -> (bool, bool) {
     let logical = show_output
-        .split("Logical monitors:")
-        .nth(1)
-        .unwrap_or_default();
-    let has_edp1 = logical.contains("eDP-1 (Built-in display)");
-    let has_edp2 = logical.contains("eDP-2 (Built-in display)");
+        .lines()
+        .skip_while(|line| line.trim() != "Logical monitors:")
+        .skip(1)
+        .take_while(|line| !line.ends_with(':') || line.starts_with(char::is_whitespace))
+        .filter_map(|line| {
+            // gdctl's tree prefix and connector names are independent of locale.
+            line.trim_start_matches(|c: char| c.is_whitespace() || "│├└─".contains(c))
+                .split_whitespace()
+                .next()
+        });
+    let mut has_edp1 = false;
+    let mut has_edp2 = false;
+    for connector in logical {
+        has_edp1 |= connector == "eDP-1";
+        has_edp2 |= connector == "eDP-2";
+    }
     (has_edp1, has_edp2)
 }
 
@@ -1529,19 +1540,58 @@ mod tests {
     }
 
     #[test]
-    fn gnome_verify_snapshot_parser_reads_logical_section_only() {
-        let sample = r#"
-Monitors:
-└──Monitor eDP-2 (Built-in display)
-Logical monitors:
-├──Logical monitor #1
-│  └──eDP-1 (Built-in display)
-└──Logical monitor #2
-   └──eDP-2 (Built-in display)
-"#;
-        let (has_edp1, has_edp2) = gnome_logical_snapshot_from_show(sample);
-        assert!(has_edp1);
-        assert!(has_edp2);
+    fn gnome_verify_snapshot_parser_handles_localized_descriptions() {
+        for description in ["Built-in display", "内置显示器", "Écran intégré"] {
+            let physical = format!(
+                "Monitors:\n├──Monitor eDP-1 ({description})\n└──Monitor eDP-2 ({description})\n"
+            );
+            for (connectors, expected, attached_matches, detached_matches) in [
+                (vec!["eDP-1", "eDP-2"], (true, true), false, true),
+                (vec!["eDP-1"], (true, false), true, false),
+                (vec!["eDP-2"], (false, true), false, false),
+                (vec![], (false, false), false, false),
+            ] {
+                let mut sample = format!("{physical}\nLogical monitors:\n");
+                for (index, connector) in connectors.iter().enumerate() {
+                    sample.push_str(&format!(
+                        "└──Logical monitor #{index}\n   └──Monitors: (1)\n       └──{connector} ({description})\n"
+                    ));
+                }
+                let snapshot = gnome_logical_snapshot_from_show(&sample);
+                assert_eq!(snapshot, expected, "{sample}");
+                assert_eq!(
+                    gnome_snapshot_matches_expected(true, snapshot.0, snapshot.1),
+                    attached_matches,
+                    "{sample}"
+                );
+                assert_eq!(
+                    gnome_snapshot_matches_expected(false, snapshot.0, snapshot.1),
+                    detached_matches,
+                    "{sample}"
+                );
+            }
+            let snapshot = gnome_logical_snapshot_from_show(&physical);
+            assert_eq!(snapshot, (false, false));
+            for attached in [true, false] {
+                assert!(!gnome_snapshot_matches_expected(
+                    attached, snapshot.0, snapshot.1
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn gnome_verify_snapshot_parser_matches_exact_connectors() {
+        for connector in ["eDP-10", "eDP-20", "eDP-1-extra", "other-eDP-1"] {
+            let sample = format!("Logical monitors:\n└──{connector} (Built-in display)\n");
+            assert_eq!(gnome_logical_snapshot_from_show(&sample), (false, false));
+        }
+        assert_eq!(
+            gnome_logical_snapshot_from_show(
+                "Logical monitors:\n└──eDP-1 (内置显示器)\nMonitors:\n└──eDP-2 (内置显示器)\n"
+            ),
+            (true, false)
+        );
     }
 
     #[test]
