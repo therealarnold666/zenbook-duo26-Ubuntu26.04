@@ -315,7 +315,7 @@ export default function Settings() {
         <div className="space-y-4">
           <SettingRow
             label="USB Media Remap"
-            description="Maps F1-F3/F5-F6 to media and brightness keys while docked"
+            description="Uses F1-F6 and F11-F12 for media and device shortcuts while docked"
             labelExtra={
               store.status.connectionType === "bluetooth" ? (
                 <Badge
@@ -361,6 +361,7 @@ export default function Settings() {
           </SettingRow>
 
           <p className="rounded-lg bg-muted/50 px-3 py-2 text-[12px] text-muted-foreground">
+            Pause or turn this off to use normal F-key shortcuts, including with Fn held.{" "}
             Requires admin approval and restarts input handling while enabled.
             You can pause/resume from the button above or from the system tray.
             For a keyboard shortcut, add a compositor keybinding that runs{" "}

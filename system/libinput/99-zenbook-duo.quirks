@@ -1,0 +1,19 @@
+# The detachable USB keyboard is part of the laptop. Without this tag,
+# libinput does not pair it with the USB touchpad for disable-while-typing.
+[Zenbook Duo UX8407AA USB keyboard]
+MatchUdevType=keyboard
+MatchBus=usb
+MatchVendor=0x0B05
+MatchProduct=0x1CD7
+AttrKeyboardIntegration=internal
+
+# The optional media remapper grabs the physical keyboard and forwards typing
+# through uinput. Tag that device too, otherwise DWT sees no typing events.
+[Zenbook Duo USB media remapper]
+MatchUdevType=keyboard
+MatchName=Zenbook Duo USB Remap
+MatchBus=usb
+MatchVendor=0x1234
+MatchProduct=0x5678
+MatchDMIModalias=dmi:*:pn*UX8407AA:*
+AttrKeyboardIntegration=internal

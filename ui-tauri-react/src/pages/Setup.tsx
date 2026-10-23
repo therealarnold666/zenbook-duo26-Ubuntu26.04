@@ -88,7 +88,8 @@ export default function Setup() {
               <div>
                 <Label className="text-[13px] font-medium">USB Media Remap</Label>
                 <p className="mt-0.5 text-[12px] text-muted-foreground">
-                  Maps F1-F3/F5-F6 to media and brightness keys while docked.
+                  Uses F1-F6 and F11-F12 for media and device shortcuts while docked.
+                  Turn off to use normal F-key shortcuts.
                 </p>
               </div>
               <div className="flex items-center gap-3">

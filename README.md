@@ -153,6 +153,37 @@ F12 opens Zenbook Duo Control. If the control panel is already running in the
 tray, F12 restores it and brings it to the foreground. The mapping works for
 both the docked USB keyboard and the detached Bluetooth keyboard.
 
+The optional **USB Media Remap** replaces F1–F6 and F11–F12 with media or
+device shortcuts. It does not track the physical Fn key, so holding Fn cannot
+bypass a remap of an incoming F-key event. Use **Settings → Keyboard → Pause**
+to pass F keys through temporarily, or turn USB Media Remap off to persist
+that choice. This is a compatibility workaround for kernels without native
+Zenbook Duo keyboard support; it does not implement Fn-lock. Native
+`hid-asus` support is being developed in the
+[upstream keyboard patch series](https://lore.landau.one/lkml/bf782ca7-f248-4048-bd55-5aa355932b3b%40linux.dev/T/).
+Validate both USB and Bluetooth input before replacing the workaround.
+
+### Touchpad suppression while typing
+
+GNOME/libinput already supports disabling touchpad motion and tapping during
+typing. A USB keyboard must be identified as internal for libinput to pair it
+with this touchpad. The runtime installer installs
+`system/libinput/99-zenbook-duo.quirks`, which identifies both the UX8407AA USB
+keyboard and the optional **Zenbook Duo USB Remap** virtual keyboard. Without
+the virtual-device rule, grabbing and forwarding the physical keyboard can
+prevent typing suppression even when GNOME's setting is enabled.
+
+Log out and back in after installing the rule so the compositor reloads
+libinput. Check the GNOME preference with:
+
+```bash
+gsettings get org.gnome.desktop.peripherals.touchpad disable-while-typing
+```
+
+Set it to `true` if desired. A fresh libinput context confirmed both docked
+USB keyboard pairings. End-to-end typing suppression after restarting the
+compositor, and detached Bluetooth behavior, still need hardware validation.
+
 ## Install
 
 Run the installer from an active GNOME, KDE Plasma, or Niri Wayland session:
@@ -330,6 +361,12 @@ sudo reboot
 - `zenbook-duo-session-agent.service`: compositor commands, hotkeys,
   accelerometer events, notifications, and session-owned display work.
 - `zenbook-duo-control`: Tauri/React control panel and tray application.
+
+Display-layout query timeouts preserve the session registration: a compositor
+that is busy during resume can outlast the query's three-second budget. The
+session agent checks the daemon's registration status every five seconds and
+re-registers only if it has been forgotten, including after a daemon restart.
+A healthy check does not replay the display layout or reset the panels.
 
 Display ownership includes the current kernel boot ID. It survives daemon
 restarts during one boot but is discarded after reboot, preventing stale

@@ -111,6 +111,9 @@ run_as_target_user cargo build --release \
   --bin zenbook-duo-usb-remap-helper
 
 echo "Installing Rust runtime binaries..."
+# A separate project-owned file preserves existing local libinput overrides.
+sudo install -D -m 0644 "${SCRIPT_DIR}/system/libinput/99-zenbook-duo.quirks" \
+  /usr/share/libinput/99-zenbook-duo.quirks
 sudo mkdir -p "${RUNTIME_INSTALL_DIR}"
 sudo install -m 0755 \
   "${TAURI_DIR}/target/release/zenbook-duo-daemon" \

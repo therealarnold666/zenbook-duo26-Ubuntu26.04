@@ -1079,7 +1079,12 @@ fn session_timeout_for_command(command: &SessionCommand) -> Duration {
 }
 
 fn should_disconnect_on_timeout(command: &SessionCommand) -> bool {
-    !matches!(command, SessionCommand::SetDockMode { .. })
+    // Display probes can queue behind a slow compositor modeset, especially
+    // during resume. A missed probe deadline is not evidence of a dead agent.
+    !matches!(
+        command,
+        SessionCommand::SetDockMode { .. } | SessionCommand::GetDisplayLayout
+    )
 }
 
 fn should_disconnect_after_timeout_streak(streak: usize) -> bool {
@@ -1655,6 +1660,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_probe_timeout_preserves_registration_and_next_dock_command() {
+        let _serial = test_serial().lock().await;
+        reset_daemon_test_state().await;
+
+        let socket_path = unique_test_socket_path("slow-display-probe");
+        let listener = UnixListener::bind(&socket_path).expect("bind mock session socket");
+        let server = tokio::spawn(async move {
+            let (slow_probe, _) = listener.accept().await.expect("accept display probe");
+            let mut lines = BufReader::new(slow_probe).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let request: Envelope<SessionCommand> = serde_json::from_str(&line).unwrap();
+            assert!(matches!(request.payload, SessionCommand::GetDisplayLayout));
+            // Keep the probe open beyond its budget, as a busy compositor does.
+            let (dock, _) = listener.accept().await.expect("accept next dock command");
+            let (reader, mut writer) = dock.into_split();
+            let line = BufReader::new(reader)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: Envelope<SessionCommand> = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                request.payload,
+                SessionCommand::SetDockMode { .. }
+            ));
+            let reply = serde_json::to_string(&Envelope::new(SessionResponse::Ack)).unwrap();
+            writer
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        {
+            let mut guard = state.write().await;
+            guard.session_agent.connected = true;
+            guard.session_agent.socket_path = Some(socket_path.to_string_lossy().into_owned());
+            guard.status.service_active = true;
+        }
+        let result = request_session(state.clone(), SessionCommand::GetDisplayLayout, true).await;
+        assert_eq!(
+            result.unwrap_err(),
+            "Timed out waiting for session response"
+        );
+        assert!(
+            state.read().await.session_agent.connected,
+            "a slow read-only probe must not unregister the running agent"
+        );
+        let result = request_session(
+            state,
+            SessionCommand::SetDockMode {
+                attached: true,
+                scale: 1.67,
+            },
+            true,
+        )
+        .await;
+        assert!(matches!(result, Ok(SessionResponse::Ack)));
+        server.await.unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
     async fn startup_display_probe_timeout_does_not_disconnect_session() {
         let _serial = test_serial().lock().await;
         reset_daemon_test_state().await;
@@ -1861,7 +1930,11 @@ mod tests {
                 scale: 1.66,
             }
         ));
-        assert!(should_disconnect_on_timeout(
+    }
+
+    #[test]
+    fn display_probe_timeout_does_not_disconnect_session_agent() {
+        assert!(!should_disconnect_on_timeout(
             &SessionCommand::GetDisplayLayout
         ));
     }

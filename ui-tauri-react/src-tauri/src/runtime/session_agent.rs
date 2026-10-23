@@ -21,13 +21,16 @@ use crate::runtime::{paths, state::RuntimeState};
 const DOCK_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const DOCK_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const KEYBOARD_BACKLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const REGISTRATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn run() -> Result<(), String> {
     ensure_user_runtime_dir()?;
     let listener = bind_session_listener(paths::current_user_session_socket_path().as_path())?;
 
     let backend = wait_for_ready_backend().await?;
-    register_with_daemon(backend).await?;
+    // Keep serving our socket even when the daemon is restarting or unavailable.
+    tokio::spawn(watch_daemon_registration(backend));
     tokio::spawn(async {
         if let Err(err) = watch_rotation().await {
             log::warn!("session-agent rotation watcher failed: {err}");
@@ -72,19 +75,94 @@ pub async fn run() -> Result<(), String> {
     }
 }
 
-async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
-    let stream = UnixStream::connect(paths::daemon_socket_path())
+async fn watch_daemon_registration(backend: SessionBackend) {
+    let mut interval = interval(REGISTRATION_CHECK_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut initial_registration = true;
+    let mut last_error = None;
+    loop {
+        interval.tick().await;
+        match maintain_daemon_registration(
+            &paths::daemon_socket_path(),
+            backend.clone(),
+            initial_registration,
+        )
         .await
-        .map_err(|e| format!("Failed to connect to daemon socket: {e}"))?;
-    let (reader, mut writer) = stream.into_split();
+        {
+            Ok(()) => {
+                initial_registration = false;
+                if last_error.take().is_some() {
+                    log::info!("session-agent daemon connection recovered");
+                }
+            }
+            Err(err) => {
+                if last_error.as_ref() != Some(&err) {
+                    log::warn!("session-agent registration check failed; will retry: {err}");
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+}
 
-    let request = Envelope::new(DaemonRequest::RegisterSessionAgent {
+async fn maintain_daemon_registration(
+    daemon_socket: &Path,
+    backend: SessionBackend,
+    initial_registration: bool,
+) -> Result<(), String> {
+    if !initial_registration {
+        // This daemon serves one target desktop user. GetStatus reports its
+        // registration flag, not whether the systemd unit happens to be running.
+        // Only register when forgotten: every registration replays the layout.
+        match request_daemon(daemon_socket, DaemonRequest::GetStatus).await? {
+            DaemonResponse::Status { status } if status.service_active => return Ok(()),
+            DaemonResponse::Status { .. } => {}
+            DaemonResponse::Error { message } => return Err(message),
+            other => {
+                return Err(format!(
+                    "Unexpected registration status response: {other:?}"
+                ))
+            }
+        }
+    }
+    let request = DaemonRequest::RegisterSessionAgent {
         session_id: detect_session_id(),
         backend,
         socket_path: paths::current_user_session_socket_path()
             .to_string_lossy()
             .into_owned(),
-    });
+    };
+    match request_daemon(daemon_socket, request).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!(
+            "Unexpected daemon registration response: {other:?}"
+        )),
+    }
+}
+
+async fn request_daemon(
+    daemon_socket: &Path,
+    request: DaemonRequest,
+) -> Result<DaemonResponse, String> {
+    timeout(
+        DAEMON_REQUEST_TIMEOUT,
+        exchange_daemon_request(daemon_socket, request),
+    )
+    .await
+    .map_err(|_| "Timed out waiting for daemon registration response".to_string())?
+}
+
+async fn exchange_daemon_request(
+    daemon_socket: &Path,
+    request: DaemonRequest,
+) -> Result<DaemonResponse, String> {
+    let stream = UnixStream::connect(daemon_socket)
+        .await
+        .map_err(|e| format!("Failed to connect to daemon socket: {e}"))?;
+    let (reader, mut writer) = stream.into_split();
+
+    let request = Envelope::new(request);
     let line = serde_json::to_string(&request)
         .map_err(|e| format!("Failed to encode registration: {e}"))?;
     writer
@@ -105,13 +183,13 @@ async fn register_with_daemon(backend: SessionBackend) -> Result<(), String> {
 
     let envelope: Envelope<DaemonResponse> = serde_json::from_str(&reply)
         .map_err(|e| format!("Invalid daemon registration response: {e}"))?;
-    match envelope.payload {
-        DaemonResponse::Ack => Ok(()),
-        DaemonResponse::Error { message } => Err(message),
-        other => Err(format!(
-            "Unexpected daemon registration response: {other:?}"
-        )),
+    if envelope.protocol_version != crate::ipc::protocol::PROTOCOL_VERSION {
+        return Err(format!(
+            "Daemon protocol mismatch: {}",
+            envelope.protocol_version
+        ));
     }
+    Ok(envelope.payload)
 }
 
 async fn handle_session_command(stream: UnixStream) -> Result<(), String> {
@@ -1298,6 +1376,109 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    async fn mock_daemon_exchange(
+        listener: &UnixListener,
+        response: DaemonResponse,
+    ) -> DaemonRequest {
+        let (stream, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let line = BufReader::new(reader)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let request: Envelope<DaemonRequest> = serde_json::from_str(&line).unwrap();
+        let reply = serde_json::to_string(&Envelope::new(response)).unwrap();
+        writer
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        request.payload
+    }
+
+    #[tokio::test]
+    async fn registration_check_recovers_lost_registration_without_periodic_replay() {
+        let socket_path = unique_test_socket_path("registration-recovery");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let request = mock_daemon_exchange(
+                &listener,
+                DaemonResponse::Status {
+                    status: crate::models::DuoStatus::default(),
+                },
+            )
+            .await;
+            assert!(matches!(request, DaemonRequest::GetStatus));
+            let request = mock_daemon_exchange(&listener, DaemonResponse::Ack).await;
+            assert!(matches!(
+                request,
+                DaemonRequest::RegisterSessionAgent {
+                    backend: SessionBackend::Gnome,
+                    ..
+                }
+            ));
+            let mut status = crate::models::DuoStatus::default();
+            status.service_active = true;
+            let request = mock_daemon_exchange(&listener, DaemonResponse::Status { status }).await;
+            assert!(matches!(request, DaemonRequest::GetStatus));
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "healthy registrations must not replay the dock layout on a timer"
+            );
+        });
+        maintain_daemon_registration(&socket_path, SessionBackend::Gnome, false)
+            .await
+            .unwrap();
+        maintain_daemon_registration(&socket_path, SessionBackend::Gnome, false)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn initial_registration_can_retry_after_daemon_becomes_available() {
+        let socket_path = unique_test_socket_path("registration-retry");
+        assert!(
+            maintain_daemon_registration(&socket_path, SessionBackend::Gnome, true)
+                .await
+                .is_err()
+        );
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let request = mock_daemon_exchange(&listener, DaemonResponse::Ack).await;
+            assert!(matches!(
+                request,
+                DaemonRequest::RegisterSessionAgent { .. }
+            ));
+        });
+        maintain_daemon_registration(&socket_path, SessionBackend::Gnome, true)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn registration_request_has_a_bounded_wait_for_an_unresponsive_daemon() {
+        let socket_path = unique_test_socket_path("registration-timeout");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(DAEMON_REQUEST_TIMEOUT + Duration::from_millis(100)).await;
+        });
+        let result = maintain_daemon_registration(&socket_path, SessionBackend::Gnome, true).await;
+        assert!(result.unwrap_err().contains("Timed out"));
+        server.await.unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
 
     #[test]
     fn watches_both_known_hotkey_abs_codes() {
