@@ -7,6 +7,16 @@ MatchVendor=0x0B05
 MatchProduct=0x1CD7
 AttrKeyboardIntegration=internal
 
+# Bluetooth touchpads are external by default. DWT is exposed for an external
+# keyboard/touchpad combo only when its pad is identified as below the keys.
+# The keyboard remains external and pairs with this pad through matching IDs.
+[Zenbook Duo UX8407AA Bluetooth keyboard touchpad]
+MatchUdevType=touchpad
+MatchBus=bluetooth
+MatchVendor=0x0B05
+MatchProduct=0x1CD8
+AttrTPKComboLayout=below
+
 # The optional media remapper grabs the physical keyboard and forwards typing
 # through uinput. Tag that device too, otherwise DWT sees no typing events.
 [Zenbook Duo USB media remapper]

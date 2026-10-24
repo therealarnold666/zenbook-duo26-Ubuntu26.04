@@ -173,6 +173,11 @@ keyboard and the optional **Zenbook Duo USB Remap** virtual keyboard. Without
 the virtual-device rule, grabbing and forwarding the physical keyboard can
 prevent typing suppression even when GNOME's setting is enabled.
 
+Detached Bluetooth mode uses a separate device ID (`0b05:1cd8`). Its touchpad
+is external by default, so the rule also identifies it as the touchpad below
+the keys in a keyboard/touchpad combination. This makes libinput expose
+disable-while-typing and pair it with the matching Bluetooth keyboard.
+
 Log out and back in after installing the rule so the compositor reloads
 libinput. Check the GNOME preference with:
 
@@ -180,9 +185,10 @@ libinput. Check the GNOME preference with:
 gsettings get org.gnome.desktop.peripherals.touchpad disable-while-typing
 ```
 
-Set it to `true` if desired. A fresh libinput context confirmed both docked
-USB keyboard pairings. End-to-end typing suppression after restarting the
-compositor, and detached Bluetooth behavior, still need hardware validation.
+Set it to `true` if desired. Fresh libinput contexts confirmed both docked
+USB keyboard pairings and that Bluetooth typing suppression is available and
+enabled with the rule. End-to-end typing suppression after restarting the
+compositor still needs hardware validation.
 
 ## Install
 
